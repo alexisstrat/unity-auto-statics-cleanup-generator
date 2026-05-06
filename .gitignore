@@ -40,3 +40,6 @@ Thumbs.db
 # Logs / temp
 *.log
 *.tmp
+
+# BenchmarkDotNet
+BenchmarkDotNet.Artifacts/

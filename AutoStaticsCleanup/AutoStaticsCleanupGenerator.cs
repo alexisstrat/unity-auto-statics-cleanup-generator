@@ -7,7 +7,9 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
 
 namespace AutoStaticsCleanup;
 
@@ -19,25 +21,137 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
 
     // Names of symbols emitted into the generated file. Centralised so emission
     // and tests share a single source of truth.
-    private const string GeneratedClassName = "AutoStaticsCleanup_Generated";
-    private const string BindingFlagsConstName = "Flags";
-    private const string ValueLocalName = "value";
-    private const string FieldLoopVarName = "field";
-    private const string PlayModeCallbackName = "OnPlayModeStateChanged";
-    private const string OpenGenericResolverName = "ResolveOpenGenericFields";
-    private const string DispatchMethodName = "Cleanup";
-    private const string PerTypeCleanupSuffix = "_Cleanup";
+    private const string CleanupBaseTypeFullName = "UnityEngine.PlayModeScopeAutoCleanup";
+    private const string NestedClassName = "UnityEngine_PlayModeScopeAutoCleanup_Both_AutoCleanupType";
+    private const string StaticFieldName = "_UnityEngine_PlayModeScopeAutoCleanup_Both_AutoCleanupType";
+    private const string CompilerGeneratedAttr = "[System.Runtime.CompilerServices.CompilerGenerated]";
 
     // -----------------------------------------------------------------
-    //  Data model
+    //  Diagnostics
     // -----------------------------------------------------------------
 
-    private enum ResetStrategy : byte
+    private static readonly DiagnosticDescriptor MustBePartial = new(
+        "ASC001",
+        "Type must be 'partial'",
+        "Type '{0}' must be declared 'partial' (and so must every enclosing type) to use [AutoStaticsCleanup]",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor ReadonlyNotSupported = new(
+        "ASC002",
+        "[AutoStaticsCleanup] cannot be applied to readonly fields",
+        "Field '{0}' is readonly; [AutoStaticsCleanup] requires a settable field",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor PropertyNeedsSetter = new(
+        "ASC003",
+        "[AutoStaticsCleanup] requires a property setter",
+        "Property '{0}' has no usable setter; [AutoStaticsCleanup] requires a settable property (init-only setters are not callable from Cleanup)",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor ManualEventNotSupported = new(
+        "ASC004",
+        "[AutoStaticsCleanup] does not support manual events",
+        "Event '{0}' has explicit 'add'/'remove' accessors; [AutoStaticsCleanup] only supports field-like events",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor NestedInGenericNotSupported = new(
+        "ASC005",
+        "[AutoStaticsCleanup] does not support types nested inside generic types",
+        "Type '{0}' is nested inside a generic type; closed generic instantiations cannot be discovered for cleanup",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor MemberMustBeStatic = new(
+        "ASC006",
+        "[AutoStaticsCleanup] requires a static member",
+        "Member '{0}' is not static; [AutoStaticsCleanup] only applies to static fields, properties, and events",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
+
+    private static readonly DiagnosticDescriptor ConstFieldNotSupported = new(
+        "ASC007",
+        "[AutoStaticsCleanup] cannot be applied to const fields",
+        "Field '{0}' is const; const fields cannot be reset and [AutoStaticsCleanup] has no effect",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
+
+    // -----------------------------------------------------------------
+    //  Cacheable models
+    // -----------------------------------------------------------------
+
+    private enum MemberKind : byte { Assign, Event }
+
+    private readonly struct LocationInfo : IEquatable<LocationInfo>
     {
-        DirectAssign, // Type.Member = init;
-        ReflectionAssign, // FieldInfo.SetValue(null, init);
-        DirectClear, // Type.Member.Clear();
-        ReflectionClear // ((Cast)FieldInfo.GetValue(null))?.Clear();
+        public string FilePath { get; init; }
+        public TextSpan Span { get; init; }
+        public LinePositionSpan LineSpan { get; init; }
+
+        public Location ToLocation() => Location.Create(FilePath ?? "", Span, LineSpan);
+
+        public bool Equals(LocationInfo other) =>
+            FilePath == other.FilePath && Span.Equals(other.Span) && LineSpan.Equals(other.LineSpan);
+
+        public override bool Equals(object obj) => obj is LocationInfo other && Equals(other);
+
+        public override int GetHashCode() =>
+            unchecked((FilePath?.GetHashCode() ?? 0) * 31 + Span.GetHashCode());
+
+        public static LocationInfo From(SyntaxReference syntaxRef)
+        {
+            if (syntaxRef == null) return default;
+            var loc = syntaxRef.GetSyntax().GetLocation();
+            return new LocationInfo
+            {
+                FilePath = loc.SourceTree?.FilePath ?? "",
+                Span = loc.SourceSpan,
+                LineSpan = loc.GetLineSpan().Span,
+            };
+        }
+    }
+
+    private readonly struct DiagnosticInfo : IEquatable<DiagnosticInfo>
+    {
+        public string DescriptorId { get; init; }
+        public string MessageArg { get; init; }
+        public LocationInfo Location { get; init; }
+
+        public bool Equals(DiagnosticInfo other) =>
+            DescriptorId == other.DescriptorId
+            && MessageArg == other.MessageArg
+            && Location.Equals(other.Location);
+
+        public override bool Equals(object obj) => obj is DiagnosticInfo other && Equals(other);
+
+        public override int GetHashCode() =>
+            unchecked((DescriptorId?.GetHashCode() ?? 0) * 31 + (MessageArg?.GetHashCode() ?? 0));
+
+        public Diagnostic ToDiagnostic()
+        {
+            var d = DescriptorId switch
+            {
+                "ASC001" => MustBePartial,
+                "ASC002" => ReadonlyNotSupported,
+                "ASC003" => PropertyNeedsSetter,
+                "ASC004" => ManualEventNotSupported,
+                "ASC005" => NestedInGenericNotSupported,
+                "ASC006" => MemberMustBeStatic,
+                "ASC007" => ConstFieldNotSupported,
+                _ => null,
+            };
+            return d == null ? null : Diagnostic.Create(d, Location.ToLocation(), MessageArg);
+        }
     }
 
     /// <summary>
@@ -47,31 +161,39 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     /// </summary>
     private readonly struct ResetEntry : IEquatable<ResetEntry>
     {
-        public string ContainingTypeDisplay { get; init; }
-        public string ContainingTypeQualified { get; init; }
+        public string ContainingTypeKey { get; init; }
+        public string Namespace { get; init; }
+        public ImmutableArray<string> PartialChain { get; init; }
+        public string SelfTypeDecl { get; init; }
         public string MemberName { get; init; }
-        public ResetStrategy Strategy { get; init; }
-        public string FieldInfoVarName { get; init; }
-        public string ReflectionFieldName { get; init; }
-        public string InitializerText { get; init; }
-        public string TypeQualified { get; init; }
-        public bool IsTypeAccessible { get; init; }
-        public bool IsValueType { get; init; }
-        public string Usings { get; init; }
-        public string OpenGenericTypeOf { get; init; }
+        public MemberKind Kind { get; init; }
+        public string DelegateTypeFq { get; init; }
+        public bool RequiresGuard { get; init; }
+        public string Initializer { get; init; }
+        public int SourceOrder { get; init; }
+        public ImmutableArray<string> FileUsings { get; init; }
+
+        /// <summary>
+        /// Namespaces of every symbol referenced by the captured initializer
+        /// expression. <see cref="EmitFileHeader"/> uses the union of these
+        /// across a file's entries to keep only the source-file usings that
+        /// are actually needed for the verbatim initializer text to compile.
+        /// </summary>
+        public ImmutableArray<string> InitializerNamespaces { get; init; }
 
         public bool Equals(ResetEntry other) =>
-            ContainingTypeQualified == other.ContainingTypeQualified &&
+            ContainingTypeKey == other.ContainingTypeKey &&
+            Namespace == other.Namespace &&
+            ChainEquals(PartialChain, other.PartialChain) &&
+            SelfTypeDecl == other.SelfTypeDecl &&
             MemberName == other.MemberName &&
-            Strategy == other.Strategy &&
-            FieldInfoVarName == other.FieldInfoVarName &&
-            ReflectionFieldName == other.ReflectionFieldName &&
-            InitializerText == other.InitializerText &&
-            TypeQualified == other.TypeQualified &&
-            IsTypeAccessible == other.IsTypeAccessible &&
-            IsValueType == other.IsValueType &&
-            Usings == other.Usings &&
-            OpenGenericTypeOf == other.OpenGenericTypeOf;
+            Kind == other.Kind &&
+            DelegateTypeFq == other.DelegateTypeFq &&
+            RequiresGuard == other.RequiresGuard &&
+            Initializer == other.Initializer &&
+            SourceOrder == other.SourceOrder &&
+            ChainEquals(FileUsings, other.FileUsings) &&
+            ChainEquals(InitializerNamespaces, other.InitializerNamespaces);
 
         public override bool Equals(object obj) => obj is ResetEntry other && Equals(other);
 
@@ -80,72 +202,212 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             unchecked
             {
                 var h = 17;
-                h = h * 31 + (ContainingTypeQualified?.GetHashCode() ?? 0);
+                h = h * 31 + (ContainingTypeKey?.GetHashCode() ?? 0);
                 h = h * 31 + (MemberName?.GetHashCode() ?? 0);
-                h = h * 31 + (ReflectionFieldName?.GetHashCode() ?? 0);
-                h = h * 31 + (OpenGenericTypeOf?.GetHashCode() ?? 0);
+                h = h * 31 + SourceOrder;
                 return h;
             }
         }
+
+        private static bool ChainEquals(ImmutableArray<string> a, ImmutableArray<string> b)
+        {
+            if (a.IsDefault) return b.IsDefault;
+            if (b.IsDefault || a.Length != b.Length) return false;
+            for (var i = 0; i < a.Length; i++)
+                if (a[i] != b[i])
+                    return false;
+            return true;
+        }
     }
+
+    private readonly struct ExtractResult : IEquatable<ExtractResult>
+    {
+        public ImmutableArray<ResetEntry> Entries { get; init; }
+        public ImmutableArray<DiagnosticInfo> Diagnostics { get; init; }
+
+        public bool Equals(ExtractResult other) =>
+            ArrEquals(Entries, other.Entries) && ArrEquals(Diagnostics, other.Diagnostics);
+
+        public override bool Equals(object obj) => obj is ExtractResult other && Equals(other);
+
+        public override int GetHashCode() =>
+            unchecked((Entries.IsDefault ? 0 : Entries.Length) * 31
+                      + (Diagnostics.IsDefault ? 0 : Diagnostics.Length));
+
+        private static bool ArrEquals<T>(ImmutableArray<T> a, ImmutableArray<T> b) where T : IEquatable<T>
+        {
+            if (a.IsDefault) return b.IsDefault;
+            if (b.IsDefault || a.Length != b.Length) return false;
+            for (var i = 0; i < a.Length; i++)
+                if (!a[i].Equals(b[i]))
+                    return false;
+            return true;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    //  Pipeline
+    // -----------------------------------------------------------------
 
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
-        var entries = context.SyntaxProvider.ForAttributeWithMetadataName(
-                AttributeFullName,
-                predicate: static (_, _) => true,
-                transform: static (ctx, ct) => Extract(ctx, ct))
-            .SelectMany(static (arr, _) => arr);
+        var results = context.SyntaxProvider.ForAttributeWithMetadataName(
+            AttributeFullName,
+            predicate: static (_, _) => true,
+            transform: static (ctx, ct) => Extract(ctx, ct));
 
-        context.RegisterSourceOutput(entries.Collect(), static (spc, members) =>
+        // Diagnostics — emitted regardless of whether entries are present.
+        context.RegisterSourceOutput(results, static (spc, r) =>
         {
-            if (members.Length == 0) return;
-            spc.AddSource("AutoStaticsCleanup.generated.cs", GenerateSource(Deduplicate(members)));
+            if (r.Diagnostics.IsDefault) return;
+            foreach (var d in r.Diagnostics)
+            {
+                var diag = d.ToDiagnostic();
+                if (diag != null) spc.ReportDiagnostic(diag);
+            }
+        });
+
+        // Source — collect, group by containing type, emit one file per group.
+        // Roslyn's per-tree caching means an emitted file with byte-identical
+        // (name, text) skips downstream parsing on the next run, so editing one
+        // attributed type doesn't force the others to re-parse.
+        context.RegisterSourceOutput(results.Collect(), static (spc, all) =>
+        {
+            var byType = new Dictionary<string, List<ResetEntry>>(StringComparer.Ordinal);
+            foreach (var r in all)
+            {
+                if (r.Entries.IsDefault) continue;
+                foreach (var e in r.Entries)
+                {
+                    if (!byType.TryGetValue(e.ContainingTypeKey, out var list))
+                    {
+                        list = new List<ResetEntry>();
+                        byType[e.ContainingTypeKey] = list;
+                    }
+                    list.Add(e);
+                }
+            }
+
+            foreach (var group in byType)
+            {
+                var deduped = DeduplicateByMember(group.Value);
+                if (deduped.Length == 0) continue;
+                var fileName = MakeFileName(deduped[0]);
+                spc.AddSource(fileName, GenerateSource(deduped));
+            }
         });
     }
 
-    private static ImmutableArray<ResetEntry> Deduplicate(ImmutableArray<ResetEntry> entries)
+    private static ImmutableArray<ResetEntry> DeduplicateByMember(List<ResetEntry> entries)
     {
-        var seen = new HashSet<(string, string)>();
-        var unique = ImmutableArray.CreateBuilder<ResetEntry>(entries.Length);
-        foreach (var m in entries)
-        {
-            var key = (m.ContainingTypeQualified, m.ReflectionFieldName ?? m.MemberName);
-            if (seen.Add(key)) unique.Add(m);
-        }
-
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var unique = ImmutableArray.CreateBuilder<ResetEntry>(entries.Count);
+        foreach (var e in entries)
+            if (seen.Add(e.MemberName))
+                unique.Add(e);
         return unique.ToImmutable();
     }
 
-    private static ImmutableArray<ResetEntry> Extract(GeneratorAttributeSyntaxContext ctx, CancellationToken ct)
+    /// <summary>
+    /// Builds the generated file name for a containing type: e.g.
+    /// <c>MyNs.Foo.autocleanup.generated.cs</c> or
+    /// <c>MyNs.Singleton_T_.autocleanup.generated.cs</c>. Generic syntax is
+    /// flattened by replacing &lt;, &gt;, and comma separators with underscores.
+    /// </summary>
+    private static string MakeFileName(ResetEntry sample)
     {
+        var sb = new StringBuilder();
+        if (!string.IsNullOrEmpty(sample.Namespace))
+        {
+            sb.Append(sample.Namespace);
+            sb.Append('.');
+        }
+        foreach (var outer in sample.PartialChain)
+        {
+            sb.Append(SanitizeForFileName(outer));
+            sb.Append('.');
+        }
+        sb.Append(SanitizeForFileName(sample.SelfTypeDecl));
+        sb.Append(".autocleanup.generated.cs");
+        return sb.ToString();
+    }
+
+    private static string SanitizeForFileName(string typeDecl)
+    {
+        // "Pair<T1, T2>" -> "Pair_T1_T2_"
+        var sb = new StringBuilder(typeDecl.Length);
+        for (var i = 0; i < typeDecl.Length; i++)
+        {
+            var c = typeDecl[i];
+            if (c == '<' || c == '>') sb.Append('_');
+            else if (c == ',')
+            {
+                sb.Append('_');
+                if (i + 1 < typeDecl.Length && typeDecl[i + 1] == ' ') i++;
+            }
+            else if (c == ' ') { /* skip */ }
+            else sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    // -----------------------------------------------------------------
+    //  Extraction
+    // -----------------------------------------------------------------
+
+    private static ExtractResult Extract(GeneratorAttributeSyntaxContext ctx, CancellationToken ct)
+    {
+        var entries = ImmutableArray.CreateBuilder<ResetEntry>();
+        var diags = ImmutableArray.CreateBuilder<DiagnosticInfo>();
         var compilation = ctx.SemanticModel.Compilation;
+
+        // Member-level dispatch: route every supported symbol kind into Add* so
+        // the methods can emit ASC006 / ASC007 / ASC004 for misuse instead of
+        // silently dropping the attribute.
         switch (ctx.TargetSymbol)
         {
             case INamedTypeSymbol type:
-                return CollectTypeMembers(type, compilation, ct);
-            case IFieldSymbol field when field.IsStatic && !field.IsConst:
-                return Single(b => AddField(b, field, compilation));
-            case IPropertySymbol prop when prop.IsStatic && !prop.IsIndexer:
-                return Single(b => AddProperty(b, prop, compilation));
-            case IEventSymbol evt when evt.IsStatic:
-                return Single(b => AddEvent(b, evt, compilation));
-            default:
-                return ImmutableArray<ResetEntry>.Empty;
+                CollectTypeMembers(type, compilation, entries, diags, ct);
+                break;
+            case IFieldSymbol field:
+                AddField(entries, diags, field, compilation);
+                break;
+            case IPropertySymbol prop when !prop.IsIndexer:
+                AddProperty(entries, diags, prop, compilation);
+                break;
+            case IEventSymbol evt:
+                AddEvent(entries, diags, evt, compilation);
+                break;
         }
 
-        static ImmutableArray<ResetEntry> Single(Action<ImmutableArray<ResetEntry>.Builder> add)
+        return new ExtractResult
         {
-            var b = ImmutableArray.CreateBuilder<ResetEntry>(1);
-            add(b);
-            return b.ToImmutable();
-        }
+            Entries = entries.ToImmutable(),
+            Diagnostics = diags.ToImmutable(),
+        };
     }
 
-    private static ImmutableArray<ResetEntry> CollectTypeMembers(
-        INamedTypeSymbol typeSymbol, Compilation compilation, CancellationToken ct)
+    private static void CollectTypeMembers(
+        INamedTypeSymbol typeSymbol,
+        Compilation compilation,
+        ImmutableArray<ResetEntry>.Builder entries,
+        ImmutableArray<DiagnosticInfo>.Builder diags,
+        CancellationToken ct)
     {
-        var results = ImmutableArray.CreateBuilder<ResetEntry>();
+        // Verify the partial chain once at the type level — if it fails, every
+        // member would emit the same diagnostic, which is just noise.
+        if (!IsPartialChain(typeSymbol))
+        {
+            diags.Add(MakePartialDiagnostic(typeSymbol, typeSymbol));
+            return;
+        }
+
+        // Precompute the type-level facts once and pass them through. Without
+        // this, every static member of a type with N attributed members would
+        // call ToDisplayString and BuildPartialChain N times against the same
+        // INamedTypeSymbol.
+        var ctx = TypeContext.For(typeSymbol);
+        var usingsCache = new Dictionary<SyntaxTree, ImmutableArray<string>>();
 
         foreach (var member in typeSymbol.GetMembers())
         {
@@ -155,436 +417,482 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             switch (member)
             {
                 case IFieldSymbol { IsStatic: true, IsConst: false, IsImplicitlyDeclared: false } f:
-                    AddField(results, f, compilation);
+                    AddField(entries, diags, f, compilation, ctx, usingsCache);
                     break;
                 case IPropertySymbol { IsStatic: true, IsIndexer: false, IsImplicitlyDeclared: false } p:
-                    AddProperty(results, p, compilation);
+                    AddProperty(entries, diags, p, compilation, ctx, usingsCache);
                     break;
                 case IEventSymbol { IsStatic: true, IsImplicitlyDeclared: false } e:
-                    AddEvent(results, e, compilation);
+                    AddEvent(entries, diags, e, compilation, ctx, usingsCache);
                     break;
             }
         }
+    }
 
-        return results.ToImmutable();
+    /// <summary>
+    /// Cached type-level facts shared by every member of a type during a
+    /// type-level scan. <see cref="ContainingTypeKey"/>, <see cref="Namespace"/>,
+    /// <see cref="PartialChain"/>, <see cref="SelfTypeDecl"/>, and
+    /// <see cref="HasGenericOuter"/> all depend only on the containing type, so
+    /// computing them once per scan instead of once per member halves the
+    /// extraction cost in the common type-level path.
+    /// </summary>
+    private readonly struct TypeContext
+    {
+        public string ContainingTypeKey { get; init; }
+        public string Namespace { get; init; }
+        public ImmutableArray<string> PartialChain { get; init; }
+        public string SelfTypeDecl { get; init; }
+        public bool HasGenericOuter { get; init; }
+
+        public static TypeContext For(INamedTypeSymbol type) => new()
+        {
+            ContainingTypeKey = TypeKey(type),
+            Namespace = NamespaceOf(type),
+            PartialChain = BuildPartialChain(type),
+            SelfTypeDecl = TypeDecl(type),
+            HasGenericOuter = AutoStaticsCleanupGenerator.HasGenericOuter(type),
+        };
+    }
+
+    private static ImmutableArray<string> GetUsingsCached(
+        ISymbol symbol,
+        Dictionary<SyntaxTree, ImmutableArray<string>> cache)
+    {
+        if (symbol.DeclaringSyntaxReferences.Length == 0) return ImmutableArray<string>.Empty;
+        var tree = symbol.DeclaringSyntaxReferences[0].SyntaxTree;
+        if (cache.TryGetValue(tree, out var hit)) return hit;
+        var result = GetUsingsFromTree(tree);
+        cache[tree] = result;
+        return result;
     }
 
     private static void AddField(
-        ImmutableArray<ResetEntry>.Builder results, IFieldSymbol field, Compilation compilation)
+        ImmutableArray<ResetEntry>.Builder entries,
+        ImmutableArray<DiagnosticInfo>.Builder diags,
+        IFieldSymbol field,
+        Compilation compilation,
+        TypeContext? ctx = null,
+        Dictionary<SyntaxTree, ImmutableArray<string>> usingsCache = null)
     {
-        var owner = field.ContainingType;
-        var display = owner.ToDisplayString();
-        var qualified = owner.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-        var usings = GetUsings(field);
-        var memberAccessible = IsAccessibleExternally(field);
-        var isCollection = HasPublicClear(field.Type);
-        var openGeneric = GetOpenGenericTypeOf(owner);
-
-        // Open generic owner — defer to the per-instantiation TypeCache
-        // resolver. Initializer text and typed locals are unsafe (may
-        // reference type parameters), so we always fall back to defaults.
-        if (openGeneric != null)
+        if (!field.IsStatic)
         {
-            if (field.IsReadOnly && !isCollection) return;
-            results.Add(new ResetEntry
-            {
-                ContainingTypeDisplay = display,
-                ContainingTypeQualified = qualified,
-                MemberName = field.Name,
-                Strategy = isCollection ? ResetStrategy.ReflectionClear : ResetStrategy.ReflectionAssign,
-                FieldInfoVarName = MakeFieldArrayVarName(display, field.Name),
-                ReflectionFieldName = field.Name,
-                Usings = usings,
-                OpenGenericTypeOf = openGeneric,
-            });
+            diags.Add(MakeMemberDiagnostic("ASC006", field));
             return;
         }
 
-        var typeQualified = field.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-        var typeAccessible = IsTypeAccessible(field.Type);
+        if (field.IsConst)
+        {
+            diags.Add(MakeMemberDiagnostic("ASC007", field));
+            return;
+        }
+
+        var owner = field.ContainingType;
+        var c = ctx ?? TypeContext.For(owner);
+
+        if (c.HasGenericOuter)
+        {
+            diags.Add(MakeNestedInGenericDiagnostic(owner, field));
+            return;
+        }
+
+        if (!IsPartialChain(owner))
+        {
+            diags.Add(MakePartialDiagnostic(owner, field));
+            return;
+        }
 
         if (field.IsReadOnly)
         {
-            // Readonly fields are only useful when they're collections we can Clear().
-            if (!isCollection) return;
-            results.Add(memberAccessible
-                ? new ResetEntry
-                {
-                    ContainingTypeDisplay = display,
-                    ContainingTypeQualified = qualified,
-                    MemberName = field.Name,
-                    Strategy = ResetStrategy.DirectClear,
-                    Usings = usings,
-                }
-                : new ResetEntry
-                {
-                    ContainingTypeDisplay = display,
-                    ContainingTypeQualified = qualified,
-                    MemberName = field.Name,
-                    Strategy = ResetStrategy.ReflectionClear,
-                    FieldInfoVarName = MakeFieldVarName(display, field.Name),
-                    ReflectionFieldName = field.Name,
-                    TypeQualified = typeQualified,
-                    IsTypeAccessible = typeAccessible,
-                    Usings = usings,
-                });
-            return;
-        }
-
-        var initText = GetFieldInitializerText(field, compilation);
-
-        results.Add(memberAccessible
-            ? new ResetEntry
+            diags.Add(new DiagnosticInfo
             {
-                ContainingTypeDisplay = display,
-                ContainingTypeQualified = qualified,
-                MemberName = field.Name,
-                Strategy = ResetStrategy.DirectAssign,
-                InitializerText = initText,
-                TypeQualified = typeQualified,
-                IsTypeAccessible = typeAccessible,
-                IsValueType = field.Type.IsValueType,
-                Usings = usings,
-            }
-            : new ResetEntry
-            {
-                ContainingTypeDisplay = display,
-                ContainingTypeQualified = qualified,
-                MemberName = field.Name,
-                Strategy = ResetStrategy.ReflectionAssign,
-                FieldInfoVarName = MakeFieldVarName(display, field.Name),
-                ReflectionFieldName = field.Name,
-                InitializerText = initText,
-                TypeQualified = typeQualified,
-                IsTypeAccessible = typeAccessible,
-                IsValueType = field.Type.IsValueType,
-                Usings = usings,
-            });
-    }
-
-    private static void AddProperty(
-        ImmutableArray<ResetEntry>.Builder results, IPropertySymbol prop, Compilation compilation)
-    {
-        var owner = prop.ContainingType;
-        var display = owner.ToDisplayString();
-        var qualified = owner.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-        var usings = GetUsings(prop);
-        var isAuto = IsAutoProperty(prop);
-
-        // Expression-bodied properties carry no state.
-        if (!isAuto
-            && prop.DeclaringSyntaxReferences.Length > 0
-            && prop.DeclaringSyntaxReferences[0].GetSyntax() is PropertyDeclarationSyntax { ExpressionBody: not null })
-            return;
-
-        var openGeneric = GetOpenGenericTypeOf(owner);
-
-        // Open generic owner — only auto-properties are reachable (a manual
-        // setter can't be invoked without a closed instance).
-        if (openGeneric != null)
-        {
-            if (!isAuto) return;
-            var openIsCollection = HasPublicClear(prop.Type);
-            if (prop.SetMethod == null && !openIsCollection) return;
-
-            results.Add(new ResetEntry
-            {
-                ContainingTypeDisplay = display,
-                ContainingTypeQualified = qualified,
-                MemberName = prop.Name,
-                Strategy = openIsCollection && prop.SetMethod == null
-                    ? ResetStrategy.ReflectionClear
-                    : ResetStrategy.ReflectionAssign,
-                FieldInfoVarName = MakeFieldArrayVarName(display, prop.Name + "_BackingField"),
-                ReflectionFieldName = BackingFieldName(prop.Name),
-                Usings = usings,
-                OpenGenericTypeOf = openGeneric,
+                DescriptorId = "ASC002",
+                MessageArg = field.Name,
+                Location = LocationInfo.From(field.DeclaringSyntaxReferences.FirstOrDefault()),
             });
             return;
         }
 
-        var typeQualified = prop.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-        var typeAccessible = IsTypeAccessible(prop.Type);
-
-        // Get-only auto-property — only useful when the type is a collection.
-        if (isAuto && prop.SetMethod == null)
+        var (initText, initNs) = GetFieldInitializer(field, compilation);
+        entries.Add(new ResetEntry
         {
-            if (!HasPublicClear(prop.Type)) return;
-
-            results.Add(IsAccessibleExternally(prop)
-                ? new ResetEntry
-                {
-                    ContainingTypeDisplay = display,
-                    ContainingTypeQualified = qualified,
-                    MemberName = prop.Name,
-                    Strategy = ResetStrategy.DirectClear,
-                    Usings = usings,
-                }
-                : new ResetEntry
-                {
-                    ContainingTypeDisplay = display,
-                    ContainingTypeQualified = qualified,
-                    MemberName = prop.Name,
-                    Strategy = ResetStrategy.ReflectionClear,
-                    FieldInfoVarName = MakeFieldVarName(display, prop.Name + "_BackingField"),
-                    ReflectionFieldName = BackingFieldName(prop.Name),
-                    TypeQualified = typeQualified,
-                    IsTypeAccessible = typeAccessible,
-                    Usings = usings,
-                });
-            return;
-        }
-
-        if (prop.SetMethod == null) return;
-
-        var initText = GetPropertyInitializerText(prop, compilation);
-        var setterAccessible = IsAccessibleExternally(prop) && IsAccessibleExternally(prop.SetMethod);
-
-        if (setterAccessible)
-        {
-            results.Add(new ResetEntry
-            {
-                ContainingTypeDisplay = display,
-                ContainingTypeQualified = qualified,
-                MemberName = prop.Name,
-                Strategy = ResetStrategy.DirectAssign,
-                InitializerText = initText,
-                TypeQualified = typeQualified,
-                IsTypeAccessible = typeAccessible,
-                IsValueType = prop.Type.IsValueType,
-                Usings = usings,
-            });
-        }
-        else if (isAuto)
-        {
-            // Auto-property with inaccessible setter — go through the backing field.
-            results.Add(new ResetEntry
-            {
-                ContainingTypeDisplay = display,
-                ContainingTypeQualified = qualified,
-                MemberName = prop.Name,
-                Strategy = ResetStrategy.ReflectionAssign,
-                FieldInfoVarName = MakeFieldVarName(display, prop.Name + "_BackingField"),
-                ReflectionFieldName = BackingFieldName(prop.Name),
-                InitializerText = initText,
-                TypeQualified = typeQualified,
-                IsTypeAccessible = typeAccessible,
-                IsValueType = prop.Type.IsValueType,
-                Usings = usings,
-            });
-        }
-        // Manual property with inaccessible setter — no safe way to reset.
-    }
-
-    private static void AddEvent(
-        ImmutableArray<ResetEntry>.Builder results, IEventSymbol evt, Compilation compilation)
-    {
-        var owner = evt.ContainingType;
-        var display = owner.ToDisplayString();
-        var qualified = owner.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-        var usings = GetUsings(evt);
-        var openGeneric = GetOpenGenericTypeOf(owner);
-
-        // Events can only be assigned (=) inside their declaring type. Since
-        // we emit a separate class, always reflect on the compiler-generated
-        // backing field (same name as the event).
-        if (openGeneric != null)
-        {
-            results.Add(new ResetEntry
-            {
-                ContainingTypeDisplay = display,
-                ContainingTypeQualified = qualified,
-                MemberName = evt.Name,
-                Strategy = ResetStrategy.ReflectionAssign,
-                FieldInfoVarName = MakeFieldArrayVarName(display, evt.Name),
-                ReflectionFieldName = evt.Name,
-                Usings = usings,
-                OpenGenericTypeOf = openGeneric,
-            });
-            return;
-        }
-
-        results.Add(new ResetEntry
-        {
-            ContainingTypeDisplay = display,
-            ContainingTypeQualified = qualified,
-            MemberName = evt.Name,
-            Strategy = ResetStrategy.ReflectionAssign,
-            FieldInfoVarName = MakeFieldVarName(display, evt.Name),
-            ReflectionFieldName = evt.Name,
-            InitializerText = GetEventInitializerText(evt, compilation),
-            TypeQualified = evt.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
-            IsTypeAccessible = IsTypeAccessible(evt.Type),
-            Usings = usings,
+            ContainingTypeKey = c.ContainingTypeKey,
+            Namespace = c.Namespace,
+            PartialChain = c.PartialChain,
+            SelfTypeDecl = c.SelfTypeDecl,
+            MemberName = field.Name,
+            Kind = MemberKind.Assign,
+            RequiresGuard = TypeRequiresGuard(field.Type),
+            Initializer = initText,
+            InitializerNamespaces = initNs,
+            SourceOrder = SourceOrderOf(field),
+            FileUsings = usingsCache != null ? GetUsingsCached(field, usingsCache) : GetUsings(field),
         });
     }
 
-    private static string BackingFieldName(string propName) => "<" + propName + ">k__BackingField";
-    
-    private static bool IsAccessibleExternally(ISymbol symbol)
+    private static void AddProperty(
+        ImmutableArray<ResetEntry>.Builder entries,
+        ImmutableArray<DiagnosticInfo>.Builder diags,
+        IPropertySymbol prop,
+        Compilation compilation,
+        TypeContext? ctx = null,
+        Dictionary<SyntaxTree, ImmutableArray<string>> usingsCache = null)
     {
-        // Symbol + every containing type must be public or internal.
-        for (var s = symbol; s != null && s.Kind != SymbolKind.Namespace; s = s.ContainingType)
+        if (!prop.IsStatic)
         {
-            var a = s.DeclaredAccessibility;
-            if (a != Accessibility.Public && a != Accessibility.Internal) return false;
+            diags.Add(MakeMemberDiagnostic("ASC006", prop));
+            return;
         }
 
+        // Expression-bodied properties carry no state.
+        if (prop.DeclaringSyntaxReferences.Length > 0
+            && prop.DeclaringSyntaxReferences[0].GetSyntax() is PropertyDeclarationSyntax { ExpressionBody: not null })
+            return;
+
+        var owner = prop.ContainingType;
+        var c = ctx ?? TypeContext.For(owner);
+
+        if (c.HasGenericOuter)
+        {
+            diags.Add(MakeNestedInGenericDiagnostic(owner, prop));
+            return;
+        }
+
+        if (!IsPartialChain(owner))
+        {
+            diags.Add(MakePartialDiagnostic(owner, prop));
+            return;
+        }
+
+        // No setter, or init-only setter — can't be reset from Cleanup().
+        if (prop.SetMethod == null || prop.SetMethod.IsInitOnly)
+        {
+            diags.Add(new DiagnosticInfo
+            {
+                DescriptorId = "ASC003",
+                MessageArg = prop.Name,
+                Location = LocationInfo.From(prop.DeclaringSyntaxReferences.FirstOrDefault()),
+            });
+            return;
+        }
+
+        var (initText, initNs) = GetPropertyInitializer(prop, compilation);
+        entries.Add(new ResetEntry
+        {
+            ContainingTypeKey = c.ContainingTypeKey,
+            Namespace = c.Namespace,
+            PartialChain = c.PartialChain,
+            SelfTypeDecl = c.SelfTypeDecl,
+            MemberName = prop.Name,
+            Kind = MemberKind.Assign,
+            RequiresGuard = TypeRequiresGuard(prop.Type),
+            Initializer = initText,
+            InitializerNamespaces = initNs,
+            SourceOrder = SourceOrderOf(prop),
+            FileUsings = usingsCache != null ? GetUsingsCached(prop, usingsCache) : GetUsings(prop),
+        });
+    }
+
+    private static void AddEvent(
+        ImmutableArray<ResetEntry>.Builder entries,
+        ImmutableArray<DiagnosticInfo>.Builder diags,
+        IEventSymbol evt,
+        Compilation compilation,
+        TypeContext? ctx = null,
+        Dictionary<SyntaxTree, ImmutableArray<string>> usingsCache = null)
+    {
+        if (!evt.IsStatic)
+        {
+            diags.Add(MakeMemberDiagnostic("ASC006", evt));
+            return;
+        }
+
+        // Manual events (with explicit add/remove) — Evt.GetInvocationList()
+        // doesn't compile because Evt isn't a delegate field outside the
+        // declaring scope of a field-like event.
+        if (!IsFieldLikeEvent(evt))
+        {
+            diags.Add(MakeMemberDiagnostic("ASC004", evt));
+            return;
+        }
+
+        var owner = evt.ContainingType;
+        var c = ctx ?? TypeContext.For(owner);
+
+        if (c.HasGenericOuter)
+        {
+            diags.Add(MakeNestedInGenericDiagnostic(owner, evt));
+            return;
+        }
+
+        if (!IsPartialChain(owner))
+        {
+            diags.Add(MakePartialDiagnostic(owner, evt));
+            return;
+        }
+
+        entries.Add(new ResetEntry
+        {
+            ContainingTypeKey = c.ContainingTypeKey,
+            Namespace = c.Namespace,
+            PartialChain = c.PartialChain,
+            SelfTypeDecl = c.SelfTypeDecl,
+            MemberName = evt.Name,
+            Kind = MemberKind.Event,
+            DelegateTypeFq = evt.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+            SourceOrder = SourceOrderOf(evt),
+            FileUsings = usingsCache != null ? GetUsingsCached(evt, usingsCache) : GetUsings(evt),
+        });
+    }
+
+    // -----------------------------------------------------------------
+    //  Symbol helpers
+    // -----------------------------------------------------------------
+
+    private static DiagnosticInfo MakePartialDiagnostic(INamedTypeSymbol type, ISymbol attributedSymbol)
+    {
+        // Walk to the first non-partial type in the chain so the message points at the offender.
+        INamedTypeSymbol offender = type;
+        for (var t = type; t != null; t = t.ContainingType)
+            if (!IsPartial(t))
+                offender = t;
+
+        // Locate the offender's declaration so the squiggly lands on the type
+        // identifier (lets the code fix add `partial` precisely there). Falls
+        // back to the attributed symbol when the type has no syntax (metadata).
+        var offenderRef = offender.DeclaringSyntaxReferences.FirstOrDefault();
+        var loc = offenderRef != null
+            ? LocationInfoForTypeIdentifier(offenderRef)
+            : LocationInfo.From(attributedSymbol.DeclaringSyntaxReferences.FirstOrDefault());
+
+        return new DiagnosticInfo
+        {
+            DescriptorId = "ASC001",
+            MessageArg = offender.ToDisplayString(),
+            Location = loc,
+        };
+    }
+
+    private static LocationInfo LocationInfoForTypeIdentifier(SyntaxReference typeRef)
+    {
+        if (typeRef.GetSyntax() is TypeDeclarationSyntax tds)
+        {
+            var loc = tds.Identifier.GetLocation();
+            return new LocationInfo
+            {
+                FilePath = loc.SourceTree?.FilePath ?? "",
+                Span = loc.SourceSpan,
+                LineSpan = loc.GetLineSpan().Span,
+            };
+        }
+        return LocationInfo.From(typeRef);
+    }
+
+    private static bool IsPartialChain(INamedTypeSymbol type)
+    {
+        for (var t = type; t != null; t = t.ContainingType)
+            if (!IsPartial(t))
+                return false;
         return true;
     }
 
-    private static bool IsTypeAccessible(ITypeSymbol type)
+    private static bool HasGenericOuter(INamedTypeSymbol type)
     {
-        if (type is IArrayTypeSymbol arr) return IsTypeAccessible(arr.ElementType);
-
-        if (type is INamedTypeSymbol named)
-        {
-            if (!IsAccessibleExternally(named)) return false;
-            // Generic args matter too: Dictionary<PrivateKey, int> isn't externally nameable.
-            foreach (var arg in named.TypeArguments)
-                if (!IsTypeAccessible(arg))
-                    return false;
-            return true;
-        }
-
-        // Type parameters (T) aren't nameable from outside the generic owner.
-        return type is not ITypeParameterSymbol;
-    }
-
-    /// <summary>
-    /// Returns the C# typeof expression for the unbound generic form of
-    /// <paramref name="type"/>, e.g. "global::Singleton&lt;&gt;" for
-    /// Singleton&lt;T&gt;. Returns null for non-generic types or types nested
-    /// inside generic types (the latter isn't currently supported).
-    /// </summary>
-    private static string GetOpenGenericTypeOf(INamedTypeSymbol type)
-    {
-        if (type == null || !type.IsGenericType) return null;
-
-        for (var ct = type.ContainingType; ct != null; ct = ct.ContainingType)
-            if (ct.IsGenericType)
-                return null;
-
-        var qualified = type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
-        var openIdx = qualified.IndexOf('<');
-        if (openIdx < 0) return null;
-        return qualified.Substring(0, openIdx) + "<" + new string(',', type.Arity - 1) + ">";
-    }
-
-    private static bool HasPublicClear(ITypeSymbol type)
-    {
-        // Walk the hierarchy for a public parameterless instance Clear() method.
-        for (var current = type; current != null; current = current.BaseType)
-        {
-            foreach (var member in current.GetMembers("Clear"))
-            {
-                if (member is IMethodSymbol
-                    {
-                        Parameters.Length: 0,
-                        IsStatic: false,
-                        DeclaredAccessibility: Accessibility.Public
-                    })
-                    return true;
-            }
-        }
-
+        for (var t = type.ContainingType; t != null; t = t.ContainingType)
+            if (t.IsGenericType)
+                return true;
         return false;
     }
 
-    private static bool IsAutoProperty(IPropertySymbol prop)
+    private static bool IsFieldLikeEvent(IEventSymbol evt) =>
+        evt.AddMethod?.IsImplicitlyDeclared ?? true;
+
+    private static DiagnosticInfo MakeMemberDiagnostic(string id, ISymbol member) =>
+        new()
+        {
+            DescriptorId = id,
+            MessageArg = member.Name,
+            Location = LocationInfo.From(member.DeclaringSyntaxReferences.FirstOrDefault()),
+        };
+
+    private static DiagnosticInfo MakeNestedInGenericDiagnostic(INamedTypeSymbol type, ISymbol attributedSymbol)
     {
-        if (prop.DeclaringSyntaxReferences.Length == 0) return false;
-        if (prop.DeclaringSyntaxReferences[0].GetSyntax() is not PropertyDeclarationSyntax pds) return false;
-        if (pds.ExpressionBody != null || pds.AccessorList == null) return false;
-        return pds.AccessorList.Accessors.All(a => a.Body == null && a.ExpressionBody == null);
+        var typeRef = type.DeclaringSyntaxReferences.FirstOrDefault();
+        var loc = typeRef != null
+            ? LocationInfoForTypeIdentifier(typeRef)
+            : LocationInfo.From(attributedSymbol.DeclaringSyntaxReferences.FirstOrDefault());
+        return new DiagnosticInfo
+        {
+            DescriptorId = "ASC005",
+            MessageArg = type.ToDisplayString(),
+            Location = loc,
+        };
     }
 
-    private static string GetFieldInitializerText(IFieldSymbol field, Compilation compilation) =>
-        field.DeclaringSyntaxReferences.Length > 0
-        && field.DeclaringSyntaxReferences[0].GetSyntax() is VariableDeclaratorSyntax vds
-            ? GetAccessibleExpression(vds.Initializer?.Value, compilation)
-            : null;
-
-    private static string GetPropertyInitializerText(IPropertySymbol prop, Compilation compilation) =>
-        prop.DeclaringSyntaxReferences.Length > 0
-        && prop.DeclaringSyntaxReferences[0].GetSyntax() is PropertyDeclarationSyntax pds
-            ? GetAccessibleExpression(pds.Initializer?.Value, compilation)
-            : null;
-
-    private static string GetEventInitializerText(IEventSymbol evt, Compilation compilation) =>
-        evt.DeclaringSyntaxReferences.Length > 0
-        && evt.DeclaringSyntaxReferences[0].GetSyntax() is VariableDeclaratorSyntax vds
-            ? GetAccessibleExpression(vds.Initializer?.Value, compilation)
-            : null;
+    private static bool IsPartial(INamedTypeSymbol type)
+    {
+        foreach (var sr in type.DeclaringSyntaxReferences)
+            if (sr.GetSyntax() is TypeDeclarationSyntax tds)
+                foreach (var mod in tds.Modifiers)
+                    if (mod.IsKind(SyntaxKind.PartialKeyword))
+                        return true;
+        return false;
+    }
 
     /// <summary>
-    /// Returns the expression text iff every symbol it references is
-    /// externally accessible. Returns null otherwise — caller falls back to
-    /// default/null.
+    /// True when a `default` write should be guarded with `is not null`.
+    /// Reference types and any type parameter — guard. Non-nullable value
+    /// types — no guard.
     /// </summary>
-    private static string GetAccessibleExpression(ExpressionSyntax expr, Compilation compilation)
+    private static bool TypeRequiresGuard(ITypeSymbol type)
     {
-        if (expr == null) return null;
-
-        var model = compilation.GetSemanticModel(expr.SyntaxTree);
-        foreach (var node in expr.DescendantNodesAndSelf())
-        {
-            var symbol = model.GetSymbolInfo(node).Symbol;
-            if (symbol == null) continue;
-
-            switch (symbol.Kind)
-            {
-                case SymbolKind.Field:
-                case SymbolKind.Property:
-                case SymbolKind.Method:
-                case SymbolKind.Event:
-                case SymbolKind.NamedType:
-                    if (!IsAccessibleExternally(symbol)) return null;
-                    break;
-            }
-        }
-
-        return expr.ToFullString().Trim();
+        if (type is ITypeParameterSymbol) return true;
+        return type.IsReferenceType;
     }
 
-    private static string GetUsings(ISymbol symbol)
+    private static int SourceOrderOf(ISymbol symbol) =>
+        symbol.DeclaringSyntaxReferences.Length == 0
+            ? 0
+            : symbol.DeclaringSyntaxReferences[0].Span.Start;
+
+    private static string TypeKey(INamedTypeSymbol type) =>
+        type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+
+    private static string NamespaceOf(INamedTypeSymbol type)
     {
-        if (symbol.DeclaringSyntaxReferences.Length == 0) return "";
-        var root = symbol.DeclaringSyntaxReferences[0].SyntaxTree.GetRoot();
+        var ns = type.ContainingNamespace;
+        return ns is { IsGlobalNamespace: false } ? ns.ToDisplayString() : "";
+    }
 
-        var sb = new StringBuilder();
-        foreach (var u in root.DescendantNodes().OfType<UsingDirectiveSyntax>())
+    /// <summary>
+    /// Renders a type's declaration form using its type parameter names.
+    /// Singleton&lt;T&gt; → "Singleton&lt;T&gt;"; Foo → "Foo".
+    /// </summary>
+    private static string TypeDecl(INamedTypeSymbol type)
+    {
+        if (type.TypeParameters.Length == 0) return type.Name;
+        var sb = new StringBuilder(type.Name);
+        sb.Append('<');
+        for (var i = 0; i < type.TypeParameters.Length; i++)
         {
-            // ToString() — not ToFullString() — drops surrounding trivia
-            // (comments, #region, #if/#endif blocks). Re-emitting that trivia
-            // into our generated file would risk reordering the using away
-            // from the top of the file, which violates CS1529.
-            //
-            // Internal trivia between the directive's own tokens IS still
-            // included by ToString() — most importantly, the line break inside
-            // a multi-line `using Alias = SomeType;`. We collapse those to
-            // single spaces so EmitUsings' \n-based split can't tear an alias
-            // in half.
-            if (sb.Length > 0) sb.Append('\n');
-            var text = u.ToString().Trim();
-            for (var i = 0; i < text.Length; i++)
-            {
-                var c = text[i];
-                sb.Append(c == '\r' || c == '\n' ? ' ' : c);
-            }
+            if (i > 0) sb.Append(", ");
+            sb.Append(type.TypeParameters[i].Name);
         }
+        sb.Append('>');
+        return sb.ToString();
+    }
 
-        // Also expose the symbol's own namespace as a using. The generated
-        // file lives at global scope, so an initializer like `new PopupManager()`
-        // captured verbatim from inside `namespace Foo { class PopupManager … }`
-        // has no way to resolve `PopupManager` unless we add `using Foo;`.
-        var ns = symbol.ContainingType?.ContainingNamespace;
-        if (ns is { IsGlobalNamespace: false })
+    private static ImmutableArray<string> BuildPartialChain(INamedTypeSymbol type)
+    {
+        // Walk inner-to-outer (cheap), then reverse — avoids List.Insert(0)'s
+        // O(n²) shifting on deeply nested types.
+        var chain = ImmutableArray.CreateBuilder<string>();
+        for (var t = type.ContainingType; t != null; t = t.ContainingType)
+            chain.Add(TypeDecl(t));
+        chain.Reverse();
+        return chain.ToImmutable();
+    }
+
+    private static (string Text, ImmutableArray<string> Namespaces) GetFieldInitializer(
+        IFieldSymbol field, Compilation compilation)
+    {
+        if (field.DeclaringSyntaxReferences.Length == 0) return (null, ImmutableArray<string>.Empty);
+        if (field.DeclaringSyntaxReferences[0].GetSyntax() is not VariableDeclaratorSyntax vds)
+            return (null, ImmutableArray<string>.Empty);
+        return CaptureInitializer(vds.Initializer?.Value, compilation);
+    }
+
+    private static (string Text, ImmutableArray<string> Namespaces) GetPropertyInitializer(
+        IPropertySymbol prop, Compilation compilation)
+    {
+        if (prop.DeclaringSyntaxReferences.Length == 0) return (null, ImmutableArray<string>.Empty);
+        if (prop.DeclaringSyntaxReferences[0].GetSyntax() is not PropertyDeclarationSyntax pds)
+            return (null, ImmutableArray<string>.Empty);
+        return CaptureInitializer(pds.Initializer?.Value, compilation);
+    }
+
+    private static (string Text, ImmutableArray<string> Namespaces) CaptureInitializer(
+        ExpressionSyntax expr, Compilation compilation)
+    {
+        if (expr == null) return (null, ImmutableArray<string>.Empty);
+        var text = expr.ToFullString().Trim();
+        var model = compilation.GetSemanticModel(expr.SyntaxTree);
+
+        // Walk every name node in the initializer and resolve it. Anything
+        // whose containing namespace is non-global ends up in the set — its
+        // using is what keeps the verbatim initializer text compiling.
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var ns = ImmutableArray.CreateBuilder<string>();
+        foreach (var node in expr.DescendantNodesAndSelf())
         {
-            if (sb.Length > 0) sb.Append('\n');
-            sb.Append("using ").Append(ns.ToDisplayString()).Append(';');
+            var info = model.GetSymbolInfo(node);
+            var symbol = info.Symbol;
+            if (symbol == null && info.CandidateSymbols.Length > 0)
+                symbol = info.CandidateSymbols[0];
+            var nsName = NamespaceOfSymbol(symbol);
+            if (nsName != null && seen.Add(nsName)) ns.Add(nsName);
         }
+        return (text, ns.ToImmutable());
+    }
 
+    private static string NamespaceOfSymbol(ISymbol symbol)
+    {
+        if (symbol == null) return null;
+        // Type symbols carry their namespace directly. Members (methods, fields,
+        // properties, events) carry a containing type whose namespace is what we want.
+        // Bare namespace symbols are skipped — usings target leaf namespaces, not
+        // the names that lead to them.
+        INamespaceSymbol ns = symbol switch
+        {
+            INamespaceSymbol => null,
+            ITypeSymbol t => t.ContainingNamespace,
+            _ => symbol.ContainingType?.ContainingNamespace ?? symbol.ContainingNamespace,
+        };
+        if (ns == null || ns.IsGlobalNamespace) return null;
+        return ns.ToDisplayString();
+    }
+
+    private static ImmutableArray<string> GetUsings(ISymbol symbol)
+    {
+        if (symbol.DeclaringSyntaxReferences.Length == 0) return ImmutableArray<string>.Empty;
+        return GetUsingsFromTree(symbol.DeclaringSyntaxReferences[0].SyntaxTree);
+    }
+
+    /// <summary>
+    /// Collects every using directive in <paramref name="tree"/>. C# only allows
+    /// usings at the compilation-unit level and inside namespace declarations, so
+    /// we hit those two spots directly instead of walking the whole tree.
+    /// </summary>
+    private static ImmutableArray<string> GetUsingsFromTree(SyntaxTree tree)
+    {
+        if (tree.GetRoot() is not CompilationUnitSyntax cu) return ImmutableArray<string>.Empty;
+
+        var builder = ImmutableArray.CreateBuilder<string>();
+
+        foreach (var u in cu.Usings) builder.Add(NormalizeUsing(u));
+
+        foreach (var ns in cu.DescendantNodes().OfType<BaseNamespaceDeclarationSyntax>())
+            foreach (var u in ns.Usings)
+                builder.Add(NormalizeUsing(u));
+
+        return builder.ToImmutable();
+    }
+
+    /// <summary>
+    /// Returns the directive's text with surrounding trivia stripped (comments,
+    /// #region, #if/#endif) and internal newlines collapsed to spaces. The
+    /// internal-newline collapse handles multi-line `using Alias = …;` directives
+    /// that would otherwise be split across the generated file's deduplication step.
+    /// </summary>
+    private static string NormalizeUsing(UsingDirectiveSyntax u)
+    {
+        var text = u.ToString().Trim();
+        var sb = new StringBuilder(text.Length);
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            sb.Append(c == '\r' || c == '\n' ? ' ' : c);
+        }
         return sb.ToString();
     }
 
@@ -596,315 +904,190 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         return false;
     }
 
-    private static string MakeFieldVarName(string containingTypeDisplay, string memberName) =>
-        SanitizeIdentifier(containingTypeDisplay) + "_" + SanitizeIdentifier(memberName) + "_Field";
-
-    private static string MakeFieldArrayVarName(string containingTypeDisplay, string memberName) =>
-        SanitizeIdentifier(containingTypeDisplay) + "_" + SanitizeIdentifier(memberName) + "_Fields";
-
-    private static string SanitizeIdentifier(string raw) => raw
-        .Replace('.', '_')
-        .Replace('+', '_')
-        .Replace('<', '_')
-        .Replace('>', '_')
-        .Replace(',', '_')
-        .Replace(" ", "");
+    // -----------------------------------------------------------------
+    //  Source generation
+    // -----------------------------------------------------------------
 
     private static string GenerateSource(ImmutableArray<ResetEntry> entries)
     {
         using var stringWriter = new StringWriter();
         using var w = new IndentedTextWriter(stringWriter);
 
-        w.WriteLine("// <auto-generated/>");
-        w.WriteLineNoTabs(string.Empty);
-        w.WriteLine("#if UNITY_EDITOR && !UNITY_6000_5_OR_NEWER");
-        w.WriteLineNoTabs(string.Empty);
+        // Caller has already grouped by containing type, deduped, and ordered.
+        EmitFileHeader(w, entries);
 
-        EmitUsings(w, entries);
-        w.WriteLineNoTabs(string.Empty);
+        var ordered = entries.OrderBy(e => e.Kind == MemberKind.Event ? 1 : 0)
+                             .ThenBy(e => e.SourceOrder)
+                             .ToList();
+        EmitTypeBlock(w, ordered[0], ordered);
 
-        w.WriteLine("[global::UnityEditor.InitializeOnLoad]");
-        w.WriteLine($"internal static class {GeneratedClassName}");
-        w.WriteLine("{");
-        w.Indent++;
-
-        EmitBindingFlagsConst(w);
-        EmitFieldInfoCache(w, entries);
-        EmitStaticConstructor(w);
-        EmitPlayModeCallback(w);
-        EmitDispatchMethod(w, entries);
-        EmitPerTypeCleanups(w, entries);
-
-        if (entries.Any(e => e.OpenGenericTypeOf != null))
-            EmitOpenGenericResolver(w);
-
-        w.Indent--;
-        w.WriteLine("}");
-        w.WriteLineNoTabs(string.Empty);
-        w.WriteLine("#endif");
+        EmitFileFooter(w);
 
         w.Flush();
         return stringWriter.ToString();
     }
 
-    private static void EmitUsings(IndentedTextWriter w, ImmutableArray<ResetEntry> entries)
+    private static void EmitFileHeader(IndentedTextWriter w, ImmutableArray<ResetEntry> entries)
     {
-        // Only the user's own usings are propagated — they're needed because
-        // initializer expressions are emitted verbatim and may use short type
-        // names. Everything we emit ourselves is fully qualified, so the
-        // generated file compiles even in assemblies whose asmdefs strip
-        // standard references (some Unity packages do).
-        var usings = new SortedSet<string>(StringComparer.Ordinal);
-        foreach (var entry in entries)
+        w.WriteLine("// <auto-generated/>");
+        w.WriteLine("#if !UNITY_6000_5_OR_NEWER");
+        w.WriteLine("#pragma warning disable CS0618");
+
+        // Union of namespaces referenced by any captured initializer in this
+        // file. We keep a source-file using only if its target namespace shows
+        // up here (or is a prefix of one — covers relative type references like
+        // `Helpers.Tool` written under `using MyApp;`).
+        var requiredNs = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var e in entries)
         {
-            if (string.IsNullOrEmpty(entry.Usings)) continue;
-            foreach (var u in entry.Usings.Split('\n'))
-            {
-                var t = u.Trim();
-                if (t.Length > 0) usings.Add(t);
-            }
+            if (e.InitializerNamespaces.IsDefaultOrEmpty) continue;
+            foreach (var n in e.InitializerNamespaces) requiredNs.Add(n);
         }
 
-        foreach (var u in usings) w.WriteLine(u);
-    }
+        // Insertion-ordered dedupe: emit System and Unity.Scripting.LifecycleManagement
+        // first (matches Unity's layout), then any source-file using actually
+        // needed by an initializer.
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var ordered = new List<string>();
+        void Add(string u) { if (seen.Add(u)) ordered.Add(u); }
 
-    private static void EmitBindingFlagsConst(IndentedTextWriter w)
-    {
-        w.WriteLine($"private const global::System.Reflection.BindingFlags {BindingFlagsConstName} =");
-        w.Indent++;
-        w.WriteLine(
-            "global::System.Reflection.BindingFlags.Static | global::System.Reflection.BindingFlags.NonPublic | global::System.Reflection.BindingFlags.Public | global::System.Reflection.BindingFlags.DeclaredOnly;");
-        w.Indent--;
-        w.WriteLineNoTabs(string.Empty);
-    }
-
-    private static void EmitFieldInfoCache(IndentedTextWriter w, ImmutableArray<ResetEntry> entries)
-    {
-        // Non-generic owners — one cached FieldInfo per entry, grouped by containing type.
-        var nonGenericGroups = entries
-            .Where(e => e.OpenGenericTypeOf == null
-                        && (e.Strategy == ResetStrategy.ReflectionAssign
-                            || e.Strategy == ResetStrategy.ReflectionClear))
-            .GroupBy(e => e.ContainingTypeDisplay)
-            .ToList();
-
-        if (nonGenericGroups.Count > 0)
+        Add("using System;");
+        Add("using Unity.Scripting.LifecycleManagement;");
+        foreach (var e in entries)
         {
-            var first = true;
-            foreach (var group in nonGenericGroups)
+            if (e.FileUsings.IsDefaultOrEmpty) continue;
+            foreach (var u in e.FileUsings)
             {
-                if (!first) w.WriteLineNoTabs(string.Empty);
-                w.WriteLine($"// --- {group.Key} ---");
-                foreach (var e in group)
-                {
-                    w.WriteLine(
-                        $"private static readonly global::System.Reflection.FieldInfo {e.FieldInfoVarName} =");
-                    w.Indent++;
-                    w.WriteLine(
-                        $"typeof({e.ContainingTypeQualified}).GetField(\"{EscapeString(e.ReflectionFieldName)}\", {BindingFlagsConstName});");
-                    w.Indent--;
-                }
-
-                first = false;
+                if (string.IsNullOrEmpty(u)) continue;
+                if (UsingIsNeeded(u, requiredNs)) Add(u);
             }
-
-            w.WriteLineNoTabs(string.Empty);
         }
+        foreach (var u in ordered) w.WriteLine(u);
+    }
 
-        // Open-generic owners — one cached FieldInfo[] per entry, populated at
-        // static-init time from Unity's TypeCache.
-        var genericGroups = entries
-            .Where(e => e.OpenGenericTypeOf != null)
-            .GroupBy(e => e.ContainingTypeDisplay)
-            .ToList();
+    /// <summary>
+    /// True if a source-file using directive should make it into the generated
+    /// file. Plain <c>using Foo;</c> directives are kept only when an initializer
+    /// references a type whose namespace matches <c>Foo</c> (or a child of
+    /// <c>Foo</c>, since the user could have written a relative name).
+    /// <c>using static</c> and <c>using Alias = …;</c> directives are always
+    /// kept — we can't trace whether their introduced names are referenced
+    /// without much heavier analysis, and over-emitting is harmless.
+    /// </summary>
+    private static bool UsingIsNeeded(string usingDirective, HashSet<string> requiredNs)
+    {
+        var trimmed = usingDirective.TrimStart();
+        if (!trimmed.StartsWith("using ", StringComparison.Ordinal)) return true;
 
-        if (genericGroups.Count > 0)
+        var body = trimmed.Substring("using ".Length).TrimEnd(';').Trim();
+        if (body.StartsWith("static ", StringComparison.Ordinal)) return true;
+        if (body.IndexOf('=') >= 0) return true;
+
+        foreach (var req in requiredNs)
+            if (req == body || req.StartsWith(body + ".", StringComparison.Ordinal))
+                return true;
+        return false;
+    }
+
+    private static void EmitFileFooter(IndentedTextWriter w)
+    {
+        w.WriteLine("#pragma warning restore CS0618");
+        w.WriteLine("#endif");
+    }
+
+    private static void EmitTypeBlock(IndentedTextWriter w, ResetEntry sample, IReadOnlyList<ResetEntry> entries)
+    {
+        var hasNs = !string.IsNullOrEmpty(sample.Namespace);
+        if (hasNs)
         {
-            var first = true;
-            foreach (var group in genericGroups)
-            {
-                if (!first) w.WriteLineNoTabs(string.Empty);
-                w.WriteLine($"// --- {group.Key} ---");
-                foreach (var e in group)
-                {
-                    w.WriteLine(
-                        $"private static readonly global::System.Reflection.FieldInfo[] {e.FieldInfoVarName} =");
-                    w.Indent++;
-                    w.WriteLine(
-                        $"{OpenGenericResolverName}(typeof({e.OpenGenericTypeOf}), \"{EscapeString(e.ReflectionFieldName)}\");");
-                    w.Indent--;
-                }
-
-                first = false;
-            }
-
-            w.WriteLineNoTabs(string.Empty);
-        }
-    }
-
-    private static void EmitStaticConstructor(IndentedTextWriter w)
-    {
-        w.WriteLine($"static {GeneratedClassName}()");
-        w.WriteLine("{");
-        w.Indent++;
-        w.WriteLine($"global::UnityEditor.EditorApplication.playModeStateChanged -= {PlayModeCallbackName};");
-        w.WriteLine($"global::UnityEditor.EditorApplication.playModeStateChanged += {PlayModeCallbackName};");
-        w.Indent--;
-        w.WriteLine("}");
-        w.WriteLineNoTabs(string.Empty);
-    }
-
-    private static void EmitPlayModeCallback(IndentedTextWriter w)
-    {
-        w.WriteLine($"private static void {PlayModeCallbackName}(global::UnityEditor.PlayModeStateChange change)");
-        w.WriteLine("{");
-        w.Indent++;
-        w.WriteLine("if (change != global::UnityEditor.PlayModeStateChange.ExitingEditMode &&");
-        w.WriteLine("    change != global::UnityEditor.PlayModeStateChange.ExitingPlayMode)");
-        w.Indent++;
-        w.WriteLine("return;");
-        w.Indent--;
-        w.WriteLine($"{DispatchMethodName}();");
-        w.Indent--;
-        w.WriteLine("}");
-    }
-
-    private static void EmitDispatchMethod(IndentedTextWriter w, ImmutableArray<ResetEntry> entries)
-    {
-        w.WriteLineNoTabs(string.Empty);
-        w.WriteLine($"private static void {DispatchMethodName}()");
-        w.WriteLine("{");
-        w.Indent++;
-        foreach (var typeDisplay in entries.Select(e => e.ContainingTypeDisplay).Distinct())
-            w.WriteLine($"{PerTypeMethodName(typeDisplay)}();");
-        w.Indent--;
-        w.WriteLine("}");
-    }
-
-    private static void EmitPerTypeCleanups(IndentedTextWriter w, ImmutableArray<ResetEntry> entries)
-    {
-        foreach (var group in entries.GroupBy(e => e.ContainingTypeDisplay))
-        {
-            w.WriteLineNoTabs(string.Empty);
-            w.WriteLine($"// --- {group.Key} ---");
-            w.WriteLine($"private static void {PerTypeMethodName(group.Key)}()");
+            w.WriteLine($"namespace {sample.Namespace}");
             w.WriteLine("{");
             w.Indent++;
-            foreach (var e in group) EmitReset(w, e);
+        }
+
+        foreach (var outer in sample.PartialChain)
+        {
+            w.WriteLine($"partial class {outer}");
+            w.WriteLine("{");
+            w.Indent++;
+        }
+
+        w.WriteLine($"partial class {sample.SelfTypeDecl}");
+        w.WriteLine("{");
+        w.Indent++;
+
+        EmitNestedCleanupClass(w, entries);
+        EmitStaticReadonlyField(w);
+
+        w.Indent--;
+        w.WriteLine("}");
+
+        for (var i = 0; i < sample.PartialChain.Length; i++)
+        {
+            w.Indent--;
+            w.WriteLine("}");
+        }
+
+        if (hasNs)
+        {
             w.Indent--;
             w.WriteLine("}");
         }
     }
 
-    private static string PerTypeMethodName(string containingTypeDisplay) =>
-        SanitizeIdentifier(containingTypeDisplay) + PerTypeCleanupSuffix;
-
-    private static void EmitOpenGenericResolver(IndentedTextWriter w)
+    private static void EmitNestedCleanupClass(IndentedTextWriter w, IReadOnlyList<ResetEntry> entries)
     {
-        w.WriteLineNoTabs(string.Empty);
-        w.WriteLine(
-            $"private static global::System.Reflection.FieldInfo[] {OpenGenericResolverName}(global::System.Type openDef, string name)");
+        w.WriteLine(CompilerGeneratedAttr);
+        w.WriteLine($"class {NestedClassName} : {CleanupBaseTypeFullName}");
         w.WriteLine("{");
         w.Indent++;
-        w.WriteLine("var seen = new global::System.Collections.Generic.HashSet<global::System.Type>();");
-        w.WriteLine("var result = new global::System.Collections.Generic.List<global::System.Reflection.FieldInfo>();");
-        w.WriteLine("foreach (var derived in global::UnityEditor.TypeCache.GetTypesDerivedFrom(openDef))");
+
+        w.WriteLine("public override void Cleanup()");
         w.WriteLine("{");
         w.Indent++;
-        w.WriteLine("var t = derived.BaseType;");
-        w.WriteLine(
-            "while (t != null && !(t.IsGenericType && !t.IsGenericTypeDefinition && t.GetGenericTypeDefinition() == openDef))");
-        w.Indent++;
-        w.WriteLine("t = t.BaseType;");
-        w.Indent--;
-        w.WriteLine("if (t == null || !seen.Add(t)) continue;");
-        w.WriteLine($"var fi = t.GetField(name, {BindingFlagsConstName});");
-        w.WriteLine("if (fi != null) result.Add(fi);");
+
+        foreach (var e in entries)
+        {
+            if (e.Kind == MemberKind.Event) EmitEvent(w, e);
+            else EmitAssign(w, e);
+        }
+
         w.Indent--;
         w.WriteLine("}");
-        w.WriteLine("return result.ToArray();");
+
+        w.WriteLine($"public {NestedClassName}() : base() {{}}");
+
         w.Indent--;
         w.WriteLine("}");
     }
 
-    private static void EmitReset(IndentedTextWriter w, ResetEntry e)
+    private static void EmitStaticReadonlyField(IndentedTextWriter w)
     {
-        if (e.OpenGenericTypeOf != null)
-        {
-            EmitOpenGenericReset(w, e);
-            return;
-        }
-
-        switch (e.Strategy)
-        {
-            case ResetStrategy.DirectAssign:
-            {
-                var rhs = e.InitializerText ?? (e.IsValueType ? "default" : "null");
-                w.WriteLine($"{e.ContainingTypeQualified}.{e.MemberName} = {rhs};");
-                break;
-            }
-
-            case ResetStrategy.ReflectionAssign:
-            {
-                if (e.IsTypeAccessible)
-                {
-                    // Typed local — preserves target-typed `new()` and collection
-                    // initializers that would lose context through SetValue(object, object).
-                    var rhs = e.InitializerText ?? (e.IsValueType ? "default" : "null");
-                    w.WriteLine(
-                        $"{{ {e.TypeQualified} {ValueLocalName} = {rhs}; {e.FieldInfoVarName}?.SetValue(null, {ValueLocalName}); }}");
-                }
-                else if (e.IsValueType)
-                {
-                    // Inaccessible value type — synthesize a default via reflection.
-                    w.WriteLine(
-                        $"if ({e.FieldInfoVarName} != null) {e.FieldInfoVarName}.SetValue(null, global::System.Activator.CreateInstance({e.FieldInfoVarName}.FieldType));");
-                }
-                else
-                {
-                    // Inaccessible reference type — null is always valid.
-                    w.WriteLine($"{e.FieldInfoVarName}?.SetValue(null, null);");
-                }
-
-                break;
-            }
-
-            case ResetStrategy.DirectClear:
-                w.WriteLine($"{e.ContainingTypeQualified}.{e.MemberName}?.Clear();");
-                break;
-
-            case ResetStrategy.ReflectionClear:
-                w.WriteLine(e.IsTypeAccessible
-                    ? $"(({e.TypeQualified}){e.FieldInfoVarName}?.GetValue(null))?.Clear();"
-                    : $"{e.FieldInfoVarName}?.GetValue(null)?.GetType().GetMethod(\"Clear\", global::System.Type.EmptyTypes)?.Invoke({e.FieldInfoVarName}.GetValue(null), null);");
-                break;
-        }
+        w.WriteLine(CompilerGeneratedAttr);
+        w.WriteLine($"static readonly {NestedClassName} {StaticFieldName} = new();");
     }
 
-    private static void EmitOpenGenericReset(IndentedTextWriter w, ResetEntry e)
+    private static void EmitAssign(IndentedTextWriter w, ResetEntry e)
     {
-        switch (e.Strategy)
-        {
-            case ResetStrategy.ReflectionAssign:
-                w.WriteLine($"foreach (var {FieldLoopVarName} in {e.FieldInfoVarName})");
-                w.Indent++;
-                w.WriteLine(
-                    $"{FieldLoopVarName}.SetValue(null, {FieldLoopVarName}.FieldType.IsValueType ? global::System.Activator.CreateInstance({FieldLoopVarName}.FieldType) : null);");
-                w.Indent--;
-                break;
-
-            case ResetStrategy.ReflectionClear:
-                w.WriteLine($"foreach (var {FieldLoopVarName} in {e.FieldInfoVarName})");
-                w.WriteLine("{");
-                w.Indent++;
-                w.WriteLine($"var {ValueLocalName} = {FieldLoopVarName}.GetValue(null);");
-                w.WriteLine(
-                    $"{ValueLocalName}?.GetType().GetMethod(\"Clear\", global::System.Type.EmptyTypes)?.Invoke({ValueLocalName}, null);");
-                w.Indent--;
-                w.WriteLine("}");
-                break;
-        }
+        var rhs = e.Initializer ?? "default";
+        if (e.RequiresGuard)
+            w.WriteLine($"if({e.MemberName} is not null) {e.MemberName} = {rhs};");
+        else
+            w.WriteLine($"{e.MemberName} = {rhs};");
     }
 
-    private static string EscapeString(string s) => s?.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    private static void EmitEvent(IndentedTextWriter w, ResetEntry e)
+    {
+        w.WriteLine($"if({e.MemberName} != null)");
+        w.WriteLine("{");
+        w.Indent++;
+        w.WriteLine($"foreach({e.DelegateTypeFq} handler in {e.MemberName}.GetInvocationList())");
+        w.WriteLine("{");
+        w.Indent++;
+        w.WriteLine($"{e.MemberName} -= handler;");
+        w.Indent--;
+        w.WriteLine("}");
+        w.Indent--;
+        w.WriteLine("}");
+    }
 }

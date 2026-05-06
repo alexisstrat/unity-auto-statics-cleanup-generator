@@ -1,0 +1,129 @@
+using System;
+using System.Collections.Immutable;
+using System.IO;
+using System.Linq;
+using AutoStaticsCleanup.Tests.Utils;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace AutoStaticsCleanup.Tests;
+
+public class IncrementalCacheTests
+{
+    private readonly ITestOutputHelper _out;
+    public IncrementalCacheTests(ITestOutputHelper o) => _out = o;
+
+    /// <summary>
+    /// Editing a file that doesn't carry [AutoStaticsCleanup] should leave the
+    /// generator's user-facing pipeline steps cached. If <c>ResetEntry.Equals</c>,
+    /// <c>ExtractResult.Equals</c>, or any nested struct's equality breaks, the
+    /// transform's output goes from <c>Unchanged</c> → <c>Modified</c>, and
+    /// <c>SourceOutput</c> falls out of cache.
+    /// </summary>
+    [Fact]
+    public void UnrelatedEditKeepsExtractAndSourceOutputCached()
+    {
+        var refs = LoadRefs();
+
+        var stub = CSharpSyntaxTree.ParseText(GeneratorTestHelper.AttributeStub, path: "stub.cs");
+        var attributed = CSharpSyntaxTree.ParseText(@"
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo { [AutoStaticsCleanup] public static int A; }",
+            path: "foo.cs");
+        var bystander = CSharpSyntaxTree.ParseText("// bystander", path: "bystander.cs");
+
+        var compilation = CSharpCompilation.Create("X",
+            new[] { stub, attributed, bystander }, refs);
+
+        GeneratorDriver driver = CSharpGeneratorDriver.Create(
+            new[] { new AutoStaticsCleanupGenerator().AsSourceGenerator() },
+            driverOptions: new GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true));
+
+        driver = driver.RunGenerators(compilation);
+
+        // Edit only the bystander tree.
+        var newBystander = CSharpSyntaxTree.ParseText("// bystander\n// edit", path: "bystander.cs");
+        compilation = compilation.ReplaceSyntaxTree(bystander, newBystander);
+        driver = driver.RunGenerators(compilation);
+
+        var run = driver.GetRunResult().Results.Single();
+
+        // Dump every tracked step for diagnostic visibility.
+        foreach (var (stepName, runs) in run.TrackedSteps)
+        foreach (var step in runs)
+        foreach (var (value, reason) in step.Outputs)
+            _out.WriteLine($"{stepName,-60} {reason} {value?.GetType().Name}");
+
+        // Steps we own: the transform's output and both RegisterSourceOutput
+        // actions. None of them should be Modified — that would mean an Equals
+        // implementation regressed.
+        AssertAllOutputsAreCacheHits(run, "result_ForAttributeWithMetadataName");
+        AssertAllOutputsAreCacheHits(run, "SourceOutput");
+    }
+
+    [Fact]
+    public void EditingAttributedFileOnlyInvalidatesThatFilesEntries()
+    {
+        var refs = LoadRefs();
+
+        var stub = CSharpSyntaxTree.ParseText(GeneratorTestHelper.AttributeStub, path: "stub.cs");
+        var fooTree = CSharpSyntaxTree.ParseText(@"
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo { [AutoStaticsCleanup] public static int A; }",
+            path: "foo.cs");
+        var barTree = CSharpSyntaxTree.ParseText(@"
+using Unity.Scripting.LifecycleManagement;
+public partial class Bar { [AutoStaticsCleanup] public static int B; }",
+            path: "bar.cs");
+
+        var compilation = CSharpCompilation.Create("X",
+            new[] { stub, fooTree, barTree }, refs);
+
+        GeneratorDriver driver = CSharpGeneratorDriver.Create(
+            new[] { new AutoStaticsCleanupGenerator().AsSourceGenerator() },
+            driverOptions: new GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true));
+
+        driver = driver.RunGenerators(compilation);
+
+        // Touch only Foo's tree (rename the field).
+        var newFoo = CSharpSyntaxTree.ParseText(@"
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo { [AutoStaticsCleanup] public static int Renamed; }",
+            path: "foo.cs");
+        compilation = compilation.ReplaceSyntaxTree(fooTree, newFoo);
+        driver = driver.RunGenerators(compilation);
+
+        var run = driver.GetRunResult().Results.Single();
+        var transformRuns = run.TrackedSteps["result_ForAttributeWithMetadataName"];
+
+        // Two declarations, two transform runs: one Modified (Foo's field), one Unchanged or Cached (Bar's).
+        var reasons = transformRuns
+            .SelectMany(s => s.Outputs.Select(o => o.Reason))
+            .ToList();
+
+        Assert.Single(reasons, r => r == IncrementalStepRunReason.Modified);
+        Assert.Contains(reasons, r => r == IncrementalStepRunReason.Unchanged || r == IncrementalStepRunReason.Cached);
+    }
+
+    private static void AssertAllOutputsAreCacheHits(GeneratorRunResult run, string stepName)
+    {
+        if (!run.TrackedSteps.TryGetValue(stepName, out var steps)) return;
+        foreach (var step in steps)
+        foreach (var (_, reason) in step.Outputs)
+            Assert.True(
+                reason == IncrementalStepRunReason.Cached || reason == IncrementalStepRunReason.Unchanged,
+                $"Step '{stepName}' produced output with reason {reason}; expected Cached or Unchanged");
+    }
+
+    private static MetadataReference[] LoadRefs()
+    {
+        var trustedAssemblies = (string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!;
+        return trustedAssemblies
+            .Split(Path.PathSeparator)
+            .Where(p => !string.IsNullOrEmpty(p) && File.Exists(p))
+            .Select(p => (MetadataReference)MetadataReference.CreateFromFile(p))
+            .ToArray();
+    }
+}

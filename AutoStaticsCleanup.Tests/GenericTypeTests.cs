@@ -5,76 +5,67 @@ namespace AutoStaticsCleanup.Tests;
 
 public class GenericTypeTests
 {
-    private static string RunGenerator(string src) => GeneratorTestHelper.RunGenerator(src);
+    private static string Run(string src) => GeneratorTestHelper.RunGenerator(src);
 
     [Fact]
-    public void OpenGenericFieldEmitsTypeCacheResolverCall()
+    public void UnconstrainedTypeParameterFieldGuards()
     {
+        // Even with no class constraint Unity emits the guard, because `default`
+        // for an unconstrained T is "null or default-value" and the pattern is
+        // valid in both shapes.
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
-public class Singleton<T> where T : class
+public partial class Bus<T>
 {
-    [AutoStaticsCleanup]
-    private static T _instance;
-}
-";
-        var output = RunGenerator(src);
-        Assert.Contains("ResolveOpenGenericFields(typeof(global::Singleton<>), \"_instance\")", output);
-        Assert.Contains("UnityEditor.TypeCache.GetTypesDerivedFrom(openDef)", output);
-        Assert.Contains("foreach (var field in", output);
-        Assert.Contains(
-            "field.FieldType.IsValueType ? global::System.Activator.CreateInstance(field.FieldType) : null",
-            output);
+    [AutoStaticsCleanup] private static T _x;
+}";
+        var output = Run(src);
+        Assert.Contains("if(_x is not null) _x = default;", output);
     }
 
     [Fact]
-    public void OpenGenericReadonlyCollectionEmitsClearLoop()
+    public void GenericTypeWithMultipleTypeParametersRenderedWithNames()
     {
         const string src = @"
-using System.Collections.Generic;
 using Unity.Scripting.LifecycleManagement;
-public class Container<T>
+public partial class Pair<T1, T2>
 {
-    [AutoStaticsCleanup]
-    private static readonly List<T> _items = new();
-}
-";
-        var output = RunGenerator(src);
-        Assert.Contains("ResolveOpenGenericFields(typeof(global::Container<>), \"_items\")", output);
-        Assert.Contains("GetMethod(\"Clear\", global::System.Type.EmptyTypes)", output);
+    [AutoStaticsCleanup] private static T1 _a;
+    [AutoStaticsCleanup] private static T2 _b;
+}";
+        var output = Run(src);
+        Assert.Contains("partial class Pair<T1, T2>", output);
+        Assert.Contains("if(_a is not null) _a = default;", output);
+        Assert.Contains("if(_b is not null) _b = default;", output);
     }
 
     [Fact]
-    public void OpenGenericEventIsHandled()
+    public void GenericFieldWithNonTypeParameterTypeDoesNotGuard()
+    {
+        // `int` doesn't depend on T — emit a bare assignment.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial class Bus<T>
+{
+    [AutoStaticsCleanup] private static int _counter;
+}";
+        var output = Run(src);
+        Assert.Contains("_counter = default;", output);
+        Assert.DoesNotContain("if(_counter", output);
+    }
+
+    [Fact]
+    public void GenericEventEmitsUnsubscribeLoop()
     {
         const string src = @"
 using System;
 using Unity.Scripting.LifecycleManagement;
-public class Bus<T>
+public partial class Bus<T>
 {
-    [AutoStaticsCleanup]
-    public static event Action<T> OnSomething;
-}
-";
-        var output = RunGenerator(src);
-        Assert.Contains("ResolveOpenGenericFields(typeof(global::Bus<>), \"OnSomething\")", output);
-    }
-
-    [Fact]
-    public void OpenGenericMultipleTypeParamsUsesArityCommas()
-    {
-        const string src = @"
-using Unity.Scripting.LifecycleManagement;
-public class Pair<T1, T2> where T1 : class where T2 : class
-{
-    [AutoStaticsCleanup]
-    private static T1 _a;
-    [AutoStaticsCleanup]
-    private static T2 _b;
-}
-";
-        var output = RunGenerator(src);
-        Assert.Contains("typeof(global::Pair<,>)", output);
+    [AutoStaticsCleanup] public static event Action<T> OnSomething;
+}";
+        var output = Run(src);
+        Assert.Contains("foreach(global::System.Action<T> handler in OnSomething.GetInvocationList())", output);
     }
 
     [Fact]
@@ -83,49 +74,30 @@ public class Pair<T1, T2> where T1 : class where T2 : class
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
 [AutoStaticsCleanup]
-public class Holder<T> where T : class
+public partial class Holder<T> where T : class
 {
     private static T _x;
     private static int _y;
-    [NoAutoStaticsCleanup]
-    private static string _skipped;
-}
-";
-        var output = RunGenerator(src);
-        Assert.Contains("ResolveOpenGenericFields(typeof(global::Holder<>), \"_x\")", output);
-        Assert.Contains("ResolveOpenGenericFields(typeof(global::Holder<>), \"_y\")", output);
-        Assert.DoesNotContain("\"_skipped\"", output);
+    [NoAutoStaticsCleanup] private static string _skipped;
+}";
+        var output = Run(src);
+        Assert.Contains("if(_x is not null) _x = default;", output);
+        Assert.Contains("_y = default;", output);
+        Assert.DoesNotContain("_skipped", output);
     }
 
     [Fact]
-    public void NonGenericFieldStillUsesDirectFieldInfoLookup()
+    public void NoTypeCacheReferencesInGeneratedOutput()
     {
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
-public class Foo
+public partial class Singleton<T> where T : class
 {
-    [AutoStaticsCleanup]
-    private static int _counter;
-}
-";
-        var output = RunGenerator(src);
-        Assert.Contains("typeof(global::Foo).GetField(\"_counter\", Flags)", output);
-        Assert.DoesNotContain("ResolveOpenGenericFields", output);
-    }
-
-    [Fact]
-    public void GenericResolverHelperEmittedOnlyWhenNeeded()
-    {
-        const string nonGenericSrc = @"
-using Unity.Scripting.LifecycleManagement;
-public class Foo
-{
-    [AutoStaticsCleanup]
-    public static int Counter;
-}
-";
-        var output = RunGenerator(nonGenericSrc);
-        Assert.DoesNotContain("ResolveOpenGenericFields", output);
-        Assert.DoesNotContain("UnityEditor.TypeCache", output);
+    [AutoStaticsCleanup] private static T _instance;
+}";
+        var output = Run(src);
+        Assert.DoesNotContain("TypeCache", output);
+        Assert.DoesNotContain("InitializeOnLoad", output);
+        Assert.DoesNotContain("playModeStateChanged", output);
     }
 }

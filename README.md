@@ -1,32 +1,64 @@
 # AutoStaticsCleanup Generator
 
-A Roslyn incremental source generator for Unity that automatically resets static fields, properties, and events when entering or exiting Play Mode in the Editor.
+A backport of Unity 6.5+'s built-in [AutoStaticsCleanup](https://docs.unity3d.com/6000.5/Documentation/ScriptReference/Unity.Scripting.LifecycleManagement.AutoStaticsCleanupAttribute.html) source generator to Unity 6.0–6.4.
 
-> **Compatibility:** works on **Unity 6.0 to Unity 6.4**. Unity 6.5 ships this functionality natively, with one caveat — its built-in implementation requires every class carrying `[AutoStaticsCleanup]` to be declared `partial`. This generator doesn't require `partial`, but **marking your attribute-bearing classes `partial` now** makes the eventual upgrade a true no-code-change drop-in: the analyzer DLL and the attribute stubs both auto-exclude via `#if !UNITY_6000_5_OR_NEWER`, and your existing source compiles unchanged against Unity's built-in implementation.
+Static fields, properties, and events marked with the `[AutoStaticsCleanup]` attribute are reset on every Editor play-mode transition.
+
+## Contents
+
+- [What it does](#what-it-does)
+- [Building](#building)
+- [Setup](#setup)
+  - [1. Define the trigger attributes and runtime scaffolding](#1-define-the-trigger-attributes-and-runtime-scaffolding)
+  - [2. Drop the analyzer DLL into Unity](#2-drop-the-analyzer-dll-into-unity)
+  - [3. Use it](#3-use-it)
+- [Diagnostics](#diagnostics)
+- [How it works](#how-it-works)
 
 ## What it does
 
 For every static member you opt in, on every Editor play-mode transition:
 
-- **Settable fields and properties** are reassigned to their declared initializer (or `default`/`null` if none).
-- **Readonly collections** with a public parameterless `Clear()` (`List<T>`, `Dictionary<TKey,TValue>`, `HashSet<T>`, custom types) are cleared in place.
-- **Static events** are reset to `null`.
-- **Generic types** like `class Singleton<T>` are expanded to every closed instantiation (`Singleton<Player>`, `Singleton<Enemy>`, …) and each one is reset.
-- Visibility doesn't matter — `private` and `internal` members work without exposing anything.
+- **Settable fields and properties** are reassigned to their declared initializer (or `default` if none). Reference-typed targets get an `if (X is not null) X = …;` guard so the assignment is a no-op for never-touched fields.
+- **Static events** are unsubscribed handler-by-handler via `GetInvocationList()`.
+- **Generic types** like `class Singleton<T>` work out of the box: the cleanup class is emitted inside the open generic, and each closed instantiation registers itself when its static constructor first runs.
+- Visibility doesn't matter — `private` and `internal` members work because the cleanup class is nested inside the target type and has direct access.
 
-## How it works
+## Building
 
-- **Detection:** `IIncrementalGenerator.ForAttributeWithMetadataName("Unity.Scripting.LifecycleManagement.AutoStaticsCleanupAttribute", …)` discovers attribute targets across the compilation.
-- **Strategy selection per member:** `DirectAssign` / `ReflectionAssign` for settable members (reflection when private or in an inaccessible type), `DirectClear` / `ReflectionClear` for readonly collections detected by walking the type for a public parameterless `Clear()`.
-- **Initializer preservation:** the right-hand side of the field/property declaration is captured verbatim and emitted into the cleanup code, after a check that every symbol it references is externally accessible. If anything's private, falls back to `default`/`null`.
-- **Open generics:** detected via `INamedTypeSymbol.IsGenericType`, mapped to a `typeof(Foo<>)` form, then resolved at static-init time via `UnityEditor.TypeCache.GetTypesDerivedFrom` — which only indexes *inheritance*, so the mechanism handles any closed instantiation that something inherits from (`class X : Foo<X>`, `class IntBus : Bus<int>`, etc.) but doesn't find isolated uses like `static Foo<int> _x;` that aren't backed by a derived class. The resulting `FieldInfo[]` is cached for the lifetime of the domain — play-mode transitions just iterate the array.
-- **Output:** the generator runs once per consuming compilation, so each assembly that uses `[AutoStaticsCleanup]` gets its own `AutoStaticsCleanup.generated.cs`. Each generated class is registered with `[UnityEditor.InitializeOnLoad]`, subscribes to `EditorApplication.playModeStateChanged`, and runs its assembly's resets on `ExitingEditMode` / `ExitingPlayMode`. The whole file is wrapped in `#if UNITY_EDITOR && !UNITY_6000_5_OR_NEWER`.
+> **No prebuilt DLL is published — you must build the analyzer yourself before [Setup](#setup).**
+
+The shippable artifact is `AutoStaticsCleanup/bin/Release/netstandard2.0/AutoStaticsCleanup.dll`. Roslyn analyzers must target **netstandard2.0**; the project is already set up that way.
+
+```bash
+# Release build — produces the DLL you drop into Unity
+dotnet build AutoStaticsCleanup/AutoStaticsCleanup.csproj -c Release
+
+# Build the whole solution (generator + tests + benchmarks)
+dotnet build AutoStaticsCleanup.sln
+
+# Run the test suite
+dotnet test AutoStaticsCleanup.Tests/AutoStaticsCleanup.Tests.csproj
+
+# Run a single test
+dotnet test AutoStaticsCleanup.Tests/AutoStaticsCleanup.Tests.csproj \
+    --filter "FullyQualifiedName~TestMethodName"
+
+# Generator benchmarks (cold + incremental cases, allocation breakdown)
+dotnet run -c Release --project AutoStaticsCleanup.Benchmarks
+# Filter to one case:
+dotnet run -c Release --project AutoStaticsCleanup.Benchmarks -- --filter "*ColdRun*"
+# Quick smoke job (fewer iterations):
+dotnet run -c Release --project AutoStaticsCleanup.Benchmarks -- --job short
+```
+
+The test suite also includes `IncrementalCacheTests` which use Roslyn's `trackIncrementalGeneratorSteps` to verify that editing a file without attributes leaves every user-facing pipeline step `Cached`/`Unchanged`.
 
 ## Setup
 
-### 1. Define the trigger attributes
+### 1. Define the trigger attributes and runtime scaffolding
 
-The generator looks for `[AutoStaticsCleanup]` and `[NoAutoStaticsCleanup]` by their fully qualified name `Unity.Scripting.LifecycleManagement.*`. From Unity 6.5 these are part of Unity itself; on earlier versions you must define them yourself. Drop these two files anywhere in `Assets/`:
+Create these 4 files in your project. <br>**Namespaces for attributes and abstract class must be exactly defined as shown in order for the generator to work and not break in a Unity 6.5+ update.**
 
 `AutoStaticsCleanupAttribute.cs`
 ```csharp
@@ -35,7 +67,7 @@ using System;
 
 namespace Unity.Scripting.LifecycleManagement
 {
-    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Field 
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Field
             | AttributeTargets.Property | AttributeTargets.Event, AllowMultiple = true)]
     public class AutoStaticsCleanupAttribute : Attribute { }
 }
@@ -49,17 +81,70 @@ using System;
 
 namespace Unity.Scripting.LifecycleManagement
 {
-    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Field 
+    [AttributeUsage(AttributeTargets.Class | AttributeTargets.Struct | AttributeTargets.Field
             | AttributeTargets.Property | AttributeTargets.Event, AllowMultiple = false)]
     public class NoAutoStaticsCleanupAttribute : Attribute { }
-    
+}
+#endif
+```
+
+`PlayModeScopeAutoCleanup.cs` — abstract base class. Generated cleanup classes derive from it.
+```csharp
+#if !UNITY_6000_5_OR_NEWER
+namespace UnityEngine
+{
+    public abstract class PlayModeScopeAutoCleanup
+    {
+        public abstract void Cleanup();
+    }
+}
+#endif
+```
+
+`PlayModeScopeAutoCleanupRegistrar.cs` — editor-only central hook (must be inside an `Editor/` folder).
+```csharp
+#if UNITY_EDITOR && !UNITY_6000_5_OR_NEWER
+using System;
+using System.Collections.Generic;
+using UnityEditor;
+using UnityEngine;
+
+namespace MyCustomNameSpace
+{
+    [InitializeOnLoad]
+    internal static class PlayModeScopeAutoCleanupRegistrar
+    {
+        private static readonly Dictionary<Type, PlayModeScopeAutoCleanup> SByType = new();
+        
+        static PlayModeScopeAutoCleanupRegistrar()
+        {
+            foreach (var t in TypeCache.GetTypesDerivedFrom<PlayModeScopeAutoCleanup>())
+            {
+                if (t.IsAbstract || t.ContainsGenericParameters) continue;
+                var instance = (PlayModeScopeAutoCleanup) Activator.CreateInstance(t);
+                var instanceType = instance.GetType();
+                SByType[instanceType] = instance;
+            }
+
+            EditorApplication.playModeStateChanged -= OnChange;
+            EditorApplication.playModeStateChanged += OnChange;
+        }
+
+        private static void OnChange(PlayModeStateChange change)
+        {
+            if (change != PlayModeStateChange.ExitingEditMode
+                && change != PlayModeStateChange.ExitingPlayMode) return;
+            foreach (var c in SByType.Values)
+                c.Cleanup();
+        }
+    }
 }
 #endif
 ```
 
 ### 2. Drop the analyzer DLL into Unity
 
-Build a Release binary (see [Building](#building)) and copy `AutoStaticsCleanup.dll` into your Unity project under `Assets/` (a folder like `Assets/Plugins/AutoStaticsCleanup/` is conventional).
+Take the `AutoStaticsCleanup.dll` you produced in [Building](#building) and copy it into your Unity project under `Assets/` (a folder like `Assets/Plugins/AutoStaticsCleanup/` is conventional).
 
 In Unity's Project window, select the DLL to open the Plugin Inspector, then:
 
@@ -73,16 +158,16 @@ Unity will reimport scripts and the generator will start producing cleanup code 
 
 ### 3. Use it
 
-Member-level — opt in one piece of state at a time:
+Member-level — opt in one piece of state at a time. The containing class must be `partial`.
 
 ```csharp
 using Unity.Scripting.LifecycleManagement;
 using System.Collections.Generic;
 
-public static class GameCache
+public static partial class GameCache
 {
     [AutoStaticsCleanup] public static int FrameCount = 0;
-    [AutoStaticsCleanup] public static readonly List<string> Loaded = new();
+    [AutoStaticsCleanup] public static List<string> Loaded = new();
     [AutoStaticsCleanup] public static event System.Action OnReset;
 }
 ```
@@ -91,19 +176,19 @@ Type-level — opt in every static member of a type, with selective opt-out:
 
 ```csharp
 [AutoStaticsCleanup]
-public static class GameCache
+public static partial class GameCache
 {
     public static int FrameCount;
-    public static readonly Dictionary<string, int> Counters = new();
+    public static Dictionary<string, int> Counters = new();
 
     [NoAutoStaticsCleanup] public static int PersistAcrossPlay;
 }
 ```
 
-Generic base class — every closed instantiation found via `TypeCache` is reset. The `Singleton<T>` pattern is the most common case, but the same mechanism works for any generic base with concrete derived types (`Repository<T>`, `Cache<TKey, TValue>`, `EventBus<T>`, …):
+Generic base class — every closed instantiation that's been touched in play mode is reset automatically. The cleanup class is emitted inside the open generic; each closed type's static constructor runs the registration when it's first referenced.
 
 ```csharp
-public class Singleton<T> : MonoBehaviour where T : MonoBehaviour
+public partial class Singleton<T> : MonoBehaviour where T : MonoBehaviour
 {
     [AutoStaticsCleanup] private static T _instance;
 
@@ -113,27 +198,30 @@ public class Singleton<T> : MonoBehaviour where T : MonoBehaviour
 
 public class PlayerManager : Singleton<PlayerManager> { }
 public class EnemyManager  : Singleton<EnemyManager>  { }
-// On play-mode change, both PlayerManager._instance and
-// EnemyManager._instance are nulled out automatically.
 ```
 
-> **Note on generics:** the generator finds closed instantiations by walking `UnityEditor.TypeCache.GetTypesDerivedFrom(typeof(Foo<>))`, which only indexes inheritance. Anything with a concrete derived type (`class X : Singleton<X>`, `class IntBus : Bus<int>`) works out of the box. Standalone uses like `static Foo<int> _x;` without an accompanying derived class won't be detected — that's the limitation of an inheritance-indexed approach. Types nested inside generic types are also not supported.
+> **Note on generics:** closed instantiations only register if their static constructor runs (i.e. the type was used at least once in play mode). Untouched types need no cleanup, so this is correct — but it does mean that abstract or unused closed types aren't enumerated through reflection. This matches Unity 6.5's built-in behavior. Types nested inside generic types are rejected at compile time via `ASC005` — closed instantiations of `Outer<T>.Inner` aren't discoverable through `TypeCache`.
 
-## Building
+## Diagnostics
 
-```bash
-# Build everything
-dotnet build AutoStaticsCleanup.sln
+Each rule ships with an IDE quick-fix (lightbulb / `Alt+Enter`) so the offending source can be repaired in place.
 
-# Run the test suite
-dotnet test AutoStaticsCleanup.Tests/AutoStaticsCleanup.Tests.csproj
+| ID | Severity | When | Quick fix |
+|---|---|---|---|
+| `ASC001` | Error | The attributed type (or any enclosing type) is not declared `partial`. | Add `partial` modifier to the offending type. |
+| `ASC002` | Error | `[AutoStaticsCleanup]` applied to a `readonly` field — Unity's pattern reassigns the field, which `readonly` disallows. | Remove the `readonly` modifier. |
+| `ASC003` | Error | `[AutoStaticsCleanup]` applied to a property without a usable setter. | Add a `set;` accessor (auto-properties only — manual / expression-bodied / init-only properties need a manual fix). |
+| `ASC004` | Error | `[AutoStaticsCleanup]` applied to a manual event (explicit `add`/`remove`). The unsubscribe loop relies on the compiler-generated backing delegate field, which manual events don't have. | None — convert to a field-like event or remove the attribute. |
+| `ASC005` | Error | The attributed type (or its enclosing chain) is nested inside a generic type. Closed instantiations of `Outer<T>.Inner` cannot be discovered for cleanup. | None — lift the type out of the generic outer. |
+| `ASC006` | Warning | `[AutoStaticsCleanup]` applied to an instance member. Only static state is cleaned up. | None — make the member `static` or remove the attribute. |
+| `ASC007` | Warning | `[AutoStaticsCleanup]` applied to a `const` field. Constants can't be reset; the attribute has no effect. | None — remove the attribute. |
 
-# Run a single test
-dotnet test AutoStaticsCleanup.Tests/AutoStaticsCleanup.Tests.csproj \
-    --filter "FullyQualifiedName~TestMethodName"
+## How it works
 
-# Release build (drop into Unity)
-dotnet build AutoStaticsCleanup/AutoStaticsCleanup.csproj -c Release
-```
+- **Detection:** `IIncrementalGenerator.ForAttributeWithMetadataName("Unity.Scripting.LifecycleManagement.AutoStaticsCleanupAttribute", …)` finds attribute targets across the compilation.
+- **Per-type emission:** for each attributed type the generator emits a `partial class T { class UnityEngine_PlayModeScopeAutoCleanup_Both_AutoCleanupType : UnityEngine.PlayModeScopeAutoCleanup { … } static readonly … = new(); }` block. The nested class overrides `Cleanup()` with direct assignments / unsubscribe loops; the static readonly field instantiates it.
+- **Registration:** the base class's constructor self-registers the instance with a registry. A central editor hook (`[InitializeOnLoad]`, one subscription only) walks `TypeCache.GetTypesDerivedFrom<PlayModeScopeAutoCleanup>()` on domain reload, force-instantiates non-generic derived types, and invokes `Cleanup()` on every registered instance on `ExitingEditMode` / `ExitingPlayMode`.
+- **Initializer preservation:** the field/property initializer expression is captured verbatim and emitted unchanged (newlines, collection initializers, target-typed `new()` all carry over). No accessibility check is needed because the cleanup class is nested inside the target type.
+- **Minimal usings:** every captured initializer is walked with the semantic model to collect the namespaces of types/methods it references. Only source-file `using` directives whose target namespace shows up in that set make it into the generated file (`using static …;` and `using Alias = …;` are kept unconditionally — too risky to trace). Generated files for simple primitive resets end up with just `using System;` and `using Unity.Scripting.LifecycleManagement;`.
+- **Output:** one generated file per attributed type, named `{Namespace}.{ClassName}.autocleanup.generated.cs`. Generic types flatten the parameter list with underscore markers (`Singleton<T>` → `Singleton_T_.autocleanup.generated.cs`, `Pair<T1, T2>` → `Pair_T1_T2_.autocleanup.generated.cs`); nested types include the outer chain (`Outer.Inner.autocleanup.generated.cs`). Each file is wrapped in `#if !UNITY_6000_5_OR_NEWER`. Per-file emission means edits to one attributed type don't invalidate the cached parse trees of the others.
 
-The shippable artifact is `AutoStaticsCleanup/bin/Release/netstandard2.0/AutoStaticsCleanup.dll`. Roslyn analyzers must target **netstandard2.0** — the project is already set up that way.
