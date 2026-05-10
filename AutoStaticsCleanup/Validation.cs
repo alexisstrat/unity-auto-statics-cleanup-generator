@@ -10,15 +10,19 @@ namespace AutoStaticsCleanup;
 /// <see cref="AutoStaticsCleanupAnalyzer"/> (which reports them) and
 /// <see cref="AutoStaticsCleanupGenerator"/> (which uses the shape predicates
 /// to decide whether to emit code for a member).
+///
+/// Only ASC001 (must be 'partial') is surfaced as a diagnostic. Every other
+/// misuse (instance member, const field, readonly field, manual event,
+/// expression-bodied property, get-only property, type nested in generic) is
+/// silently skipped to match Unity 6.5's source generator. The compiler
+/// itself signals the partial-required case via "duplicate definition" once
+/// the generated partial collides with the user's non-partial declaration —
+/// ASC001 surfaces that pre-codegen with a clearer message and a one-click fix.
 /// </summary>
 internal static class Validation
 {
     public const string AttributeFullName = "Unity.Scripting.LifecycleManagement.AutoStaticsCleanupAttribute";
     public const string NoAttributeFullName = "Unity.Scripting.LifecycleManagement.NoAutoStaticsCleanupAttribute";
-
-    // -----------------------------------------------------------------
-    //  Descriptors
-    // -----------------------------------------------------------------
 
     public static readonly DiagnosticDescriptor MustBePartial = new(
         "ASC001",
@@ -26,46 +30,6 @@ internal static class Validation
         "Type '{0}' must be declared 'partial' (and so must every enclosing type) to use [AutoStaticsCleanup]",
         "AutoStaticsCleanup",
         DiagnosticSeverity.Error,
-        isEnabledByDefault: true);
-
-    public static readonly DiagnosticDescriptor PropertyNeedsSetter = new(
-        "ASC003",
-        "[AutoStaticsCleanup] requires a property setter",
-        "Property '{0}' has no usable setter; [AutoStaticsCleanup] requires a settable property (init-only setters are not callable from Cleanup)",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Error,
-        isEnabledByDefault: true);
-
-    public static readonly DiagnosticDescriptor ManualEventNotSupported = new(
-        "ASC004",
-        "[AutoStaticsCleanup] does not support manual events",
-        "Event '{0}' has explicit 'add'/'remove' accessors; [AutoStaticsCleanup] only supports field-like events",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Error,
-        isEnabledByDefault: true);
-
-    public static readonly DiagnosticDescriptor NestedInGenericNotSupported = new(
-        "ASC005",
-        "[AutoStaticsCleanup] does not support types nested inside generic types",
-        "Type '{0}' is nested inside a generic type; closed generic instantiations cannot be discovered for cleanup",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Error,
-        isEnabledByDefault: true);
-
-    public static readonly DiagnosticDescriptor MemberMustBeStatic = new(
-        "ASC006",
-        "[AutoStaticsCleanup] requires a static member",
-        "Member '{0}' is not static; [AutoStaticsCleanup] only applies to static fields, properties, and events",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Warning,
-        isEnabledByDefault: true);
-
-    public static readonly DiagnosticDescriptor ConstFieldNotSupported = new(
-        "ASC007",
-        "[AutoStaticsCleanup] cannot be applied to const fields",
-        "Field '{0}' is const; const fields cannot be reset and [AutoStaticsCleanup] has no effect",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Warning,
         isEnabledByDefault: true);
 
     // -----------------------------------------------------------------
@@ -90,14 +54,6 @@ internal static class Validation
         return true;
     }
 
-    public static bool HasGenericOuter(INamedTypeSymbol type)
-    {
-        for (var t = type.ContainingType; t != null; t = t.ContainingType)
-            if (t.IsGenericType)
-                return true;
-        return false;
-    }
-
     public static bool IsFieldLikeEvent(IEventSymbol evt) =>
         evt.AddMethod?.IsImplicitlyDeclared ?? true;
 
@@ -120,63 +76,54 @@ internal static class Validation
     // -----------------------------------------------------------------
     //  Validation (analyzer-only)
     // -----------------------------------------------------------------
+    //
+    // The Validate* methods return ASC001 only when the generator would
+    // actually emit code for this member — i.e. when every silent-skip
+    // condition (non-static, const, readonly, manual event, etc.) passes.
+    // A static readonly field in a non-partial class produces no
+    // diagnostic because the generator silently skips readonly anyway,
+    // so there's no "duplicate definition" risk to warn about.
 
-    /// <summary>
-    /// Returns a diagnostic if <paramref name="field"/> is not a valid
-    /// [AutoStaticsCleanup] target, or null if it is.
-    /// </summary>
     public static Diagnostic ValidateField(IFieldSymbol field)
     {
-        if (!field.IsStatic)
-            return Diagnostic.Create(MemberMustBeStatic, FirstLocationOf(field), field.Name);
-        if (field.IsConst)
-            return Diagnostic.Create(ConstFieldNotSupported, FirstLocationOf(field), field.Name);
+        // Silent skips (Unity-parity): no diagnostic.
+        if (!field.IsStatic) return null;
+        if (field.IsConst) return null;
+        if (field.IsReadOnly) return null;
 
+        // Field would be emitted; flag the partial-chain problem before the
+        // C# compiler trips over a duplicate-definition error.
         var owner = field.ContainingType;
-        if (HasGenericOuter(owner))
-            return CreateNestedInGenericDiagnostic(owner, field);
-        if (!IsPartialChain(owner))
-            return CreatePartialDiagnostic(owner, field);
+        if (!IsPartialChain(owner)) return CreatePartialDiagnostic(owner, field);
 
-        // readonly fields are silently skipped by both analyzer and generator —
-        // matches Unity 6.5's source generator (which emits no diagnostic for
-        // [AutoStaticsCleanup] on a readonly field, just drops it from output).
         return null;
     }
 
     public static Diagnostic ValidateProperty(IPropertySymbol prop)
     {
-        if (!prop.IsStatic)
-            return Diagnostic.Create(MemberMustBeStatic, FirstLocationOf(prop), prop.Name);
+        if (!prop.IsStatic) return null;
 
         // Expression-bodied — silently skipped (carries no state).
         if (prop.DeclaringSyntaxReferences.Length > 0
             && prop.DeclaringSyntaxReferences[0].GetSyntax() is PropertyDeclarationSyntax { ExpressionBody: not null })
             return null;
 
+        // No setter or init-only setter — silently skipped (Unity-parity).
+        if (prop.SetMethod == null || prop.SetMethod.IsInitOnly) return null;
+
         var owner = prop.ContainingType;
-        if (HasGenericOuter(owner))
-            return CreateNestedInGenericDiagnostic(owner, prop);
-        if (!IsPartialChain(owner))
-            return CreatePartialDiagnostic(owner, prop);
-        if (prop.SetMethod == null || prop.SetMethod.IsInitOnly)
-            return Diagnostic.Create(PropertyNeedsSetter, FirstLocationOf(prop), prop.Name);
+        if (!IsPartialChain(owner)) return CreatePartialDiagnostic(owner, prop);
 
         return null;
     }
 
     public static Diagnostic ValidateEvent(IEventSymbol evt)
     {
-        if (!evt.IsStatic)
-            return Diagnostic.Create(MemberMustBeStatic, FirstLocationOf(evt), evt.Name);
-        if (!IsFieldLikeEvent(evt))
-            return Diagnostic.Create(ManualEventNotSupported, FirstLocationOf(evt), evt.Name);
+        if (!evt.IsStatic) return null;
+        if (!IsFieldLikeEvent(evt)) return null;
 
         var owner = evt.ContainingType;
-        if (HasGenericOuter(owner))
-            return CreateNestedInGenericDiagnostic(owner, evt);
-        if (!IsPartialChain(owner))
-            return CreatePartialDiagnostic(owner, evt);
+        if (!IsPartialChain(owner)) return CreatePartialDiagnostic(owner, evt);
 
         return null;
     }
@@ -192,11 +139,6 @@ internal static class Validation
         return Diagnostic.Create(MustBePartial, AnchorLocation(offender, attributedSymbol), offender.ToDisplayString());
     }
 
-    public static Diagnostic CreateNestedInGenericDiagnostic(INamedTypeSymbol type, ISymbol attributedSymbol)
-    {
-        return Diagnostic.Create(NestedInGenericNotSupported, AnchorLocation(type, attributedSymbol), type.ToDisplayString());
-    }
-    
     private static Location AnchorLocation(INamedTypeSymbol typeForFallback, ISymbol attributedSymbol)
     {
         if (attributedSymbol is INamedTypeSymbol)

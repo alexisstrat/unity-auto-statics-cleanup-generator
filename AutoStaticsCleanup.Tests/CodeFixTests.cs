@@ -34,17 +34,4 @@ public class Outer
         Assert.Contains("public partial class Outer", fixed_);
     }
 
-    [Fact]
-    public void Asc003AddsSetAccessorToGetOnlyAutoProperty()
-    {
-        const string src = @"
-using Unity.Scripting.LifecycleManagement;
-public partial class Foo
-{
-    [AutoStaticsCleanup] public static int Counter { get; } = 5;
-}";
-        var fixed_ = CodeFixTestHelper.ApplyFirstFix(src, "ASC003");
-        Assert.Contains("get;", fixed_);
-        Assert.Contains("set;", fixed_);
-    }
 }

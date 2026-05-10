@@ -15,13 +15,7 @@ namespace AutoStaticsCleanup;
 public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
 {
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics { get; } =
-        ImmutableArray.Create(
-            Validation.MustBePartial,
-            Validation.PropertyNeedsSetter,
-            Validation.ManualEventNotSupported,
-            Validation.NestedInGenericNotSupported,
-            Validation.MemberMustBeStatic,
-            Validation.ConstFieldNotSupported);
+        ImmutableArray.Create(Validation.MustBePartial);
 
     public override void Initialize(AnalysisContext context)
     {

@@ -1,6 +1,5 @@
 using System.Collections.Immutable;
 using System.Composition;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
@@ -16,7 +15,7 @@ namespace AutoStaticsCleanup;
 public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
 {
     public override ImmutableArray<string> FixableDiagnosticIds { get; } =
-        ImmutableArray.Create("ASC001", "ASC003");
+        ImmutableArray.Create("ASC001");
 
     public override FixAllProvider GetFixAllProvider() => WellKnownFixAllProviders.BatchFixer;
 
@@ -27,22 +26,11 @@ public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
 
         foreach (var diagnostic in context.Diagnostics)
         {
+            if (diagnostic.Id != "ASC001") continue;
             var node = root.FindNode(diagnostic.Location.SourceSpan, getInnermostNodeForTie: true);
-            switch (diagnostic.Id)
-            {
-                case "ASC001":
-                    RegisterAddPartial(context, root, node, diagnostic);
-                    break;
-                case "ASC003":
-                    RegisterAddSetter(context, root, node, diagnostic);
-                    break;
-            }
+            RegisterAddPartial(context, root, node, diagnostic);
         }
     }
-
-    // -----------------------------------------------------------------
-    //  ASC001 — add `partial`
-    // -----------------------------------------------------------------
 
     private static void RegisterAddPartial(
         CodeFixContext context, SyntaxNode root, SyntaxNode node, Diagnostic diagnostic)
@@ -89,54 +77,5 @@ public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
             if (m.IsKind(SyntaxKind.PartialKeyword))
                 return true;
         return false;
-    }
-
-    // -----------------------------------------------------------------
-    //  ASC003 — add `set;` accessor (auto-property only)
-    // -----------------------------------------------------------------
-
-    private static void RegisterAddSetter(
-        CodeFixContext context, SyntaxNode root, SyntaxNode node, Diagnostic diagnostic)
-    {
-        var propDecl = node.FirstAncestorOrSelf<PropertyDeclarationSyntax>();
-        if (propDecl == null) return;
-        if (propDecl.AccessorList == null) return; // expression-bodied — out of scope
-
-        // Auto-property check: every accessor body-less.
-        foreach (var accessor in propDecl.AccessorList.Accessors)
-            if (accessor.Body != null || accessor.ExpressionBody != null)
-                return;
-
-        // Already has a non-init setter? Nothing to fix.
-        var setter = propDecl.AccessorList.Accessors.FirstOrDefault(a => a.IsKind(SyntaxKind.SetAccessorDeclaration));
-        var initSetter = propDecl.AccessorList.Accessors.FirstOrDefault(a => a.IsKind(SyntaxKind.InitAccessorDeclaration));
-
-        if (setter != null) return;
-
-        context.RegisterCodeFix(
-            CodeAction.Create(
-                title: initSetter != null
-                    ? "Replace 'init' with 'set' accessor"
-                    : "Add 'set;' accessor",
-                createChangedDocument: ct => AddSetterAsync(context.Document, root, propDecl, ct),
-                equivalenceKey: "ASC003_AddSetter"),
-            diagnostic);
-    }
-
-    private static Task<Document> AddSetterAsync(
-        Document document, SyntaxNode root, PropertyDeclarationSyntax propDecl, CancellationToken ct)
-    {
-        var newSetter = SyntaxFactory.AccessorDeclaration(SyntaxKind.SetAccessorDeclaration)
-            .WithSemicolonToken(SyntaxFactory.Token(SyntaxKind.SemicolonToken));
-
-        var accessors = propDecl.AccessorList!.Accessors
-            .Where(a => !a.IsKind(SyntaxKind.InitAccessorDeclaration))
-            .ToList();
-        accessors.Add(newSetter);
-
-        var newAccessorList = propDecl.AccessorList.WithAccessors(SyntaxFactory.List(accessors));
-        var newDecl = propDecl.WithAccessorList(newAccessorList);
-
-        return Task.FromResult(document.WithSyntaxRoot(root.ReplaceNode(propDecl, newDecl)));
     }
 }

@@ -285,11 +285,9 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
 
     /// <summary>
     /// Cached type-level facts shared by every member of a type during a
-    /// type-level scan. <see cref="ContainingTypeKey"/>, <see cref="Namespace"/>,
-    /// <see cref="PartialChain"/>, <see cref="SelfTypeDecl"/>, and
-    /// <see cref="HasGenericOuter"/> all depend only on the containing type, so
-    /// computing them once per scan instead of once per member halves the
-    /// extraction cost in the common type-level path.
+    /// type-level scan. The four fields all depend only on the containing
+    /// type, so computing them once per scan instead of once per member
+    /// halves the extraction cost in the common type-level path.
     /// </summary>
     private readonly struct TypeContext
     {
@@ -297,7 +295,6 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         public string Namespace { get; init; }
         public ImmutableArray<string> PartialChain { get; init; }
         public string SelfTypeDecl { get; init; }
-        public bool HasGenericOuter { get; init; }
 
         public static TypeContext For(INamedTypeSymbol type) => new()
         {
@@ -305,7 +302,6 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             Namespace = NamespaceOf(type),
             PartialChain = BuildPartialChain(type),
             SelfTypeDecl = TypeDecl(type),
-            HasGenericOuter = Validation.HasGenericOuter(type),
         };
     }
 
@@ -330,13 +326,12 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     {
         if (!field.IsStatic) return;
         if (field.IsConst) return;
+        if (field.IsReadOnly) return;
 
         var owner = field.ContainingType;
         var c = ctx ?? TypeContext.For(owner);
 
-        if (c.HasGenericOuter) return;
         if (!Validation.IsPartialChain(owner)) return;
-        if (field.IsReadOnly) return;
 
         var (initText, initNs) = GetFieldInitializer(field, compilation);
         entries.Add(new ResetEntry
@@ -369,14 +364,13 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             && prop.DeclaringSyntaxReferences[0].GetSyntax() is PropertyDeclarationSyntax { ExpressionBody: not null })
             return;
 
+        // No setter, or init-only setter — can't be reset from Cleanup().
+        if (prop.SetMethod == null || prop.SetMethod.IsInitOnly) return;
+
         var owner = prop.ContainingType;
         var c = ctx ?? TypeContext.For(owner);
 
-        if (c.HasGenericOuter) return;
         if (!Validation.IsPartialChain(owner)) return;
-
-        // No setter, or init-only setter — can't be reset from Cleanup().
-        if (prop.SetMethod == null || prop.SetMethod.IsInitOnly) return;
 
         var (initText, initNs) = GetPropertyInitializer(prop, compilation);
         entries.Add(new ResetEntry
@@ -412,7 +406,6 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         var owner = evt.ContainingType;
         var c = ctx ?? TypeContext.For(owner);
 
-        if (c.HasGenericOuter) return;
         if (!Validation.IsPartialChain(owner)) return;
 
         entries.Add(new ResetEntry

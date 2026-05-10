@@ -200,22 +200,15 @@ public class PlayerManager : Singleton<PlayerManager> { }
 public class EnemyManager  : Singleton<EnemyManager>  { }
 ```
 
-> **Note on generics:** closed instantiations only register if their static constructor runs (i.e. the type was used at least once in play mode). Untouched types need no cleanup, so this is correct — but it does mean that abstract or unused closed types aren't enumerated through reflection. This matches Unity 6.5's built-in behavior. Types nested inside generic types are rejected at compile time via `ASC005` — closed instantiations of `Outer<T>.Inner` aren't discoverable through `TypeCache`.
+> **Note on generics:** closed instantiations only register if their static constructor runs (i.e. the type was used at least once in play mode). Untouched types need no cleanup, so this is correct — but it does mean that abstract or unused closed types aren't enumerated through reflection. This matches Unity 6.5's built-in behavior. Types nested inside a generic outer (`Outer<T>.Inner`) compile and emit cleanup code, but only closed instantiations whose static constructor runs in play mode actually register — same caveat applies.
 
 ## Diagnostics
 
-Diagnostics are reported by `AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator). They surface in Solution Explorer's analyzer node, are configurable via `dotnet_diagnostic.ASC00X.severity = …` in `.editorconfig`, and run independently of source generation.
-
-Each rule ships with an IDE quick-fix (lightbulb / `Alt+Enter`) so the offending source can be repaired in place.
+`AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator) reports a single rule, `ASC001`. Every other misuse — instance member, const field, readonly field, manual event, expression-bodied property, get-only property, type nested in a generic — is silently skipped to match Unity 6.5's source generator. The C# compiler itself signals the partial-required case via "duplicate definition" once the generated partial collides with the user's non-partial declaration; `ASC001` surfaces that pre-codegen with a clearer message and a one-click fix.
 
 | ID | Severity | When | Quick fix |
 |---|---|---|---|
-| `ASC001` | Error | The attributed type (or any enclosing type) is not declared `partial`. | Add `partial` modifier to the offending type. |
-| `ASC003` | Error | `[AutoStaticsCleanup]` applied to a property without a usable setter. | Add a `set;` accessor (auto-properties only — manual / expression-bodied / init-only properties need a manual fix). |
-| `ASC004` | Error | `[AutoStaticsCleanup]` applied to a manual event (explicit `add`/`remove`). The unsubscribe loop relies on the compiler-generated backing delegate field, which manual events don't have. | None — convert to a field-like event or remove the attribute. |
-| `ASC005` | Error | The attributed type (or its enclosing chain) is nested inside a generic type. Closed instantiations of `Outer<T>.Inner` cannot be discovered for cleanup. | None — lift the type out of the generic outer. |
-| `ASC006` | Warning | `[AutoStaticsCleanup]` applied to an instance member. Only static state is cleaned up. | None — make the member `static` or remove the attribute. |
-| `ASC007` | Warning | `[AutoStaticsCleanup]` applied to a `const` field. Constants can't be reset; the attribute has no effect. | None — remove the attribute. |
+| `ASC001` | Error | The attributed type (or any enclosing type) is not declared `partial`, and the generator would otherwise emit code for at least one member. | Add `partial` modifier to the offending type. |
 
 ## How it works
 
