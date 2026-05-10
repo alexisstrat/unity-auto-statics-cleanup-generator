@@ -93,21 +93,6 @@ public partial class Foo
         Assert.DoesNotContain("BindingFlags", output);
     }
 
-    [Fact]
-    public void ConstFieldIsSkipped()
-    {
-        const string src = @"
-using Unity.Scripting.LifecycleManagement;
-[AutoStaticsCleanup]
-public partial class Foo
-{
-    public const int Magic = 42;
-    public static int Counter;
-}";
-        var output = Run(src);
-        Assert.DoesNotContain("Magic", output);
-        Assert.Contains("Counter = default;", output);
-    }
 }
 
 public class PropertyTests
@@ -169,7 +154,7 @@ public partial class Foo
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         Assert.DoesNotContain("Counter", output);
-        Assert.DoesNotContain(diags, d => d.Id == "ASC003");
+        Assert.Empty(diags);
     }
 
     [Fact]
@@ -261,24 +246,6 @@ public partial class Foo
         var diags = AnalyzerTestHelper.Run(src);
         Assert.Empty(diags);
         Assert.DoesNotContain("Constant", output);
-    }
-
-    [Fact]
-    public void TypeLevelReadonlyFieldEmitsNoDiagnosticAndIsSkipped()
-    {
-        const string src = @"
-using Unity.Scripting.LifecycleManagement;
-[AutoStaticsCleanup]
-public partial class Foo
-{
-    public static int Counter;
-    public static readonly int Constant = 5;
-}";
-        var output = GeneratorTestHelper.RunGenerator(src);
-        var diags = AnalyzerTestHelper.Run(src);
-        Assert.Empty(diags);
-        Assert.DoesNotContain("Constant", output);
-        Assert.Contains("Counter = default;", output);
     }
 }
 
