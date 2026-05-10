@@ -165,7 +165,8 @@ public partial class Foo
     private static int _x;
     [AutoStaticsCleanup] public static int Counter => _x;
 }";
-        var (output, diags) = GeneratorTestHelper.Run(src);
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.DoesNotContain("Counter", output);
         Assert.DoesNotContain(diags, d => d.Id == "ASC003");
     }
@@ -179,7 +180,7 @@ public partial class Foo
 {
     [AutoStaticsCleanup] public static int Counter { get; } = 5;
 }";
-        var (_, diags) = GeneratorTestHelper.Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.Contains(diags, d => d.Id == "ASC003");
     }
 
@@ -252,7 +253,8 @@ public partial class Foo
 {
     [AutoStaticsCleanup] public static readonly int Constant = 5;
 }";
-        var (output, diags) = GeneratorTestHelper.Run(src);
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.Contains(diags, d => d.Id == "ASC002");
         Assert.DoesNotContain("Constant", output);
     }
@@ -270,7 +272,8 @@ public class Foo
 {
     [AutoStaticsCleanup] public static int Counter;
 }";
-        var (output, diags) = GeneratorTestHelper.Run(src);
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.Contains(diags, d => d.Id == "ASC001");
         Assert.DoesNotContain("Counter", output);
     }
@@ -287,7 +290,7 @@ public class Outer
         [AutoStaticsCleanup] public static int Counter;
     }
 }";
-        var (_, diags) = GeneratorTestHelper.Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.Contains(diags, d => d.Id == "ASC001");
     }
 
@@ -302,7 +305,7 @@ public class Foo
     public static int A;
     public static int B;
 }";
-        var (_, diags) = GeneratorTestHelper.Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
         // One diagnostic emitted at the type level rather than one per member.
         Assert.Single(diags, d => d.Id == "ASC001");
     }
@@ -319,7 +322,8 @@ public partial class Outer
         [AutoStaticsCleanup] public static int Counter;
     }
 }";
-        var (output, diags) = GeneratorTestHelper.Run(src);
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.DoesNotContain(diags, d => d.Id == "ASC001");
         Assert.Contains("partial class Outer", output);
         Assert.Contains("partial class Inner", output);
@@ -341,7 +345,8 @@ public partial class Bus
     [AutoStaticsCleanup]
     public static event Action OnSomething { add { _backing += value; } remove { _backing -= value; } }
 }";
-        var (output, diags) = GeneratorTestHelper.Run(src);
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.Contains(diags, d => d.Id == "ASC004");
         Assert.DoesNotContain("OnSomething", output);
     }
@@ -356,7 +361,7 @@ public partial class Bus
 {
     [AutoStaticsCleanup] public static event Action OnSomething;
 }";
-        var (_, diags) = GeneratorTestHelper.Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.DoesNotContain(diags, d => d.Id == "ASC004");
     }
 }
@@ -375,7 +380,8 @@ public partial class Outer<T>
         [AutoStaticsCleanup] public static int Counter;
     }
 }";
-        var (output, diags) = GeneratorTestHelper.Run(src);
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.Contains(diags, d => d.Id == "ASC005");
         Assert.DoesNotContain("Counter", output);
     }
@@ -389,7 +395,7 @@ public partial class Singleton<T> where T : class
 {
     [AutoStaticsCleanup] private static T _instance;
 }";
-        var (_, diags) = GeneratorTestHelper.Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.DoesNotContain(diags, d => d.Id == "ASC005");
     }
 }
@@ -405,7 +411,7 @@ public partial class Foo
 {
     [AutoStaticsCleanup] public int Counter;
 }";
-        var (_, diags) = GeneratorTestHelper.Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.Contains(diags, d => d.Id == "ASC006");
     }
 
@@ -418,7 +424,7 @@ public partial class Foo
 {
     [AutoStaticsCleanup] public int Counter { get; set; }
 }";
-        var (_, diags) = GeneratorTestHelper.Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.Contains(diags, d => d.Id == "ASC006");
     }
 
@@ -432,7 +438,7 @@ public partial class Bus
 {
     [AutoStaticsCleanup] public event Action OnSomething;
 }";
-        var (_, diags) = GeneratorTestHelper.Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.Contains(diags, d => d.Id == "ASC006");
     }
 
@@ -445,7 +451,7 @@ public partial class Foo
 {
     [AutoStaticsCleanup] public const int Magic = 42;
 }";
-        var (_, diags) = GeneratorTestHelper.Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.Contains(diags, d => d.Id == "ASC007");
     }
 
@@ -463,7 +469,8 @@ public partial class Foo
     public int Instance;
     public static int Counter;
 }";
-        var (output, diags) = GeneratorTestHelper.Run(src);
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
         Assert.DoesNotContain(diags, d => d.Id == "ASC006" || d.Id == "ASC007");
         Assert.Contains("Counter = default;", output);
     }
@@ -729,7 +736,7 @@ public partial class Bar
 {
     [AutoStaticsCleanup] public static int B;
 }";
-        var (files, _) = GeneratorTestHelper.RunFiles(src);
+        var files = GeneratorTestHelper.RunFiles(src);
         Assert.Equal(2, files.Length);
         Assert.Contains(files, f => f.FileName == "Foo.autocleanup.generated.cs");
         Assert.Contains(files, f => f.FileName == "Bar.autocleanup.generated.cs");
@@ -747,7 +754,7 @@ namespace MyNs.Inner
         [AutoStaticsCleanup] public static int A;
     }
 }";
-        var (files, _) = GeneratorTestHelper.RunFiles(src);
+        var files = GeneratorTestHelper.RunFiles(src);
         Assert.Single(files, f => f.FileName == "MyNs.Inner.Foo.autocleanup.generated.cs");
     }
 
@@ -764,7 +771,7 @@ public partial class Pair<T1, T2>
 {
     [AutoStaticsCleanup] private static int _x;
 }";
-        var (files, _) = GeneratorTestHelper.RunFiles(src);
+        var files = GeneratorTestHelper.RunFiles(src);
         Assert.Contains(files, f => f.FileName == "Singleton_T_.autocleanup.generated.cs");
         Assert.Contains(files, f => f.FileName == "Pair_T1_T2_.autocleanup.generated.cs");
     }
@@ -781,7 +788,7 @@ public partial class Outer
         [AutoStaticsCleanup] public static int A;
     }
 }";
-        var (files, _) = GeneratorTestHelper.RunFiles(src);
+        var files = GeneratorTestHelper.RunFiles(src);
         Assert.Single(files, f => f.FileName == "Outer.Inner.autocleanup.generated.cs");
     }
 }

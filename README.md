@@ -204,6 +204,8 @@ public class EnemyManager  : Singleton<EnemyManager>  { }
 
 ## Diagnostics
 
+Diagnostics are reported by `AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator). They surface in Solution Explorer's analyzer node, are configurable via `dotnet_diagnostic.ASC00X.severity = …` in `.editorconfig`, and run independently of source generation.
+
 Each rule ships with an IDE quick-fix (lightbulb / `Alt+Enter`) so the offending source can be repaired in place.
 
 | ID | Severity | When | Quick fix |
