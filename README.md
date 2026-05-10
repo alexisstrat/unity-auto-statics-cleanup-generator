@@ -211,7 +211,6 @@ Each rule ships with an IDE quick-fix (lightbulb / `Alt+Enter`) so the offending
 | ID | Severity | When | Quick fix |
 |---|---|---|---|
 | `ASC001` | Error | The attributed type (or any enclosing type) is not declared `partial`. | Add `partial` modifier to the offending type. |
-| `ASC002` | Error | `[AutoStaticsCleanup]` applied to a `readonly` field — Unity's pattern reassigns the field, which `readonly` disallows. | Remove the `readonly` modifier. |
 | `ASC003` | Error | `[AutoStaticsCleanup]` applied to a property without a usable setter. | Add a `set;` accessor (auto-properties only — manual / expression-bodied / init-only properties need a manual fix). |
 | `ASC004` | Error | `[AutoStaticsCleanup]` applied to a manual event (explicit `add`/`remove`). The unsubscribe loop relies on the compiler-generated backing delegate field, which manual events don't have. | None — convert to a field-like event or remove the attribute. |
 | `ASC005` | Error | The attributed type (or its enclosing chain) is nested inside a generic type. Closed instantiations of `Outer<T>.Inner` cannot be discovered for cleanup. | None — lift the type out of the generic outer. |

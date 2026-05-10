@@ -243,10 +243,10 @@ public partial class Foo
     }
 }
 
-public class ReadonlyDiagnosticTests
+public class ReadonlyFieldTests
 {
     [Fact]
-    public void ReadonlyFieldEmitsAsc002()
+    public void MemberLevelReadonlyFieldEmitsNoDiagnosticAndIsSkipped()
     {
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
@@ -256,10 +256,27 @@ public partial class Foo
 }";
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
-        Assert.Contains(diags, d => d.Id == "ASC002");
+        Assert.Empty(diags);
         Assert.DoesNotContain("Constant", output);
     }
 
+    [Fact]
+    public void TypeLevelReadonlyFieldEmitsNoDiagnosticAndIsSkipped()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    public static int Counter;
+    public static readonly int Constant = 5;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
+        Assert.DoesNotContain("Constant", output);
+        Assert.Contains("Counter = default;", output);
+    }
 }
 
 public class PartialDiagnosticTests

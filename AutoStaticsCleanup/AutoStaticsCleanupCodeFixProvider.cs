@@ -16,7 +16,7 @@ namespace AutoStaticsCleanup;
 public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
 {
     public override ImmutableArray<string> FixableDiagnosticIds { get; } =
-        ImmutableArray.Create("ASC001", "ASC002", "ASC003");
+        ImmutableArray.Create("ASC001", "ASC003");
 
     public override FixAllProvider GetFixAllProvider() => WellKnownFixAllProviders.BatchFixer;
 
@@ -32,9 +32,6 @@ public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
             {
                 case "ASC001":
                     RegisterAddPartial(context, root, node, diagnostic);
-                    break;
-                case "ASC002":
-                    RegisterRemoveReadonly(context, root, node, diagnostic);
                     break;
                 case "ASC003":
                     RegisterAddSetter(context, root, node, diagnostic);
@@ -92,40 +89,6 @@ public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
             if (m.IsKind(SyntaxKind.PartialKeyword))
                 return true;
         return false;
-    }
-
-    // -----------------------------------------------------------------
-    //  ASC002 — remove `readonly`
-    // -----------------------------------------------------------------
-
-    private static void RegisterRemoveReadonly(
-        CodeFixContext context, SyntaxNode root, SyntaxNode node, Diagnostic diagnostic)
-    {
-        var fieldDecl = node.FirstAncestorOrSelf<FieldDeclarationSyntax>();
-        if (fieldDecl == null) return;
-
-        var readonlyToken = fieldDecl.Modifiers.FirstOrDefault(m => m.IsKind(SyntaxKind.ReadOnlyKeyword));
-        if (readonlyToken == default) return;
-
-        context.RegisterCodeFix(
-            CodeAction.Create(
-                title: "Remove 'readonly' modifier",
-                createChangedDocument: ct => RemoveReadonlyAsync(context.Document, root, fieldDecl, ct),
-                equivalenceKey: "ASC002_RemoveReadonly"),
-            diagnostic);
-    }
-
-    private static Task<Document> RemoveReadonlyAsync(
-        Document document, SyntaxNode root, FieldDeclarationSyntax fieldDecl, CancellationToken ct)
-    {
-        var newModifiers = SyntaxFactory.TokenList(
-            fieldDecl.Modifiers.Where(m => !m.IsKind(SyntaxKind.ReadOnlyKeyword)));
-
-        // Preserve any leading trivia from the readonly token by attaching it
-        // to whatever modifier ends up first; if no modifiers remain, attach to
-        // the field's type.
-        var newDecl = fieldDecl.WithModifiers(newModifiers);
-        return Task.FromResult(document.WithSyntaxRoot(root.ReplaceNode(fieldDecl, newDecl)));
     }
 
     // -----------------------------------------------------------------

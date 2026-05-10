@@ -28,14 +28,6 @@ internal static class Validation
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
-    public static readonly DiagnosticDescriptor ReadonlyNotSupported = new(
-        "ASC002",
-        "[AutoStaticsCleanup] cannot be applied to readonly fields",
-        "Field '{0}' is readonly; [AutoStaticsCleanup] requires a settable field",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Error,
-        isEnabledByDefault: true);
-
     public static readonly DiagnosticDescriptor PropertyNeedsSetter = new(
         "ASC003",
         "[AutoStaticsCleanup] requires a property setter",
@@ -145,9 +137,10 @@ internal static class Validation
             return CreateNestedInGenericDiagnostic(owner, field);
         if (!IsPartialChain(owner))
             return CreatePartialDiagnostic(owner, field);
-        if (field.IsReadOnly)
-            return Diagnostic.Create(ReadonlyNotSupported, FirstLocationOf(field), field.Name);
 
+        // readonly fields are silently skipped by both analyzer and generator —
+        // matches Unity 6.5's source generator (which emits no diagnostic for
+        // [AutoStaticsCleanup] on a readonly field, just drops it from output).
         return null;
     }
 

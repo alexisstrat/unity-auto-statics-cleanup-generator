@@ -17,7 +17,6 @@ public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics { get; } =
         ImmutableArray.Create(
             Validation.MustBePartial,
-            Validation.ReadonlyNotSupported,
             Validation.PropertyNeedsSetter,
             Validation.ManualEventNotSupported,
             Validation.NestedInGenericNotSupported,
