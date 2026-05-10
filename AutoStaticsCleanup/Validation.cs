@@ -196,16 +196,19 @@ internal static class Validation
             if (!IsPartial(t))
                 offender = t;
 
-        var loc = LocationForTypeIdentifier(offender);
-        if (loc == null) loc = FirstLocationOf(attributedSymbol);
-        return Diagnostic.Create(MustBePartial, loc, offender.ToDisplayString());
+        return Diagnostic.Create(MustBePartial, AnchorLocation(offender, attributedSymbol), offender.ToDisplayString());
     }
 
     public static Diagnostic CreateNestedInGenericDiagnostic(INamedTypeSymbol type, ISymbol attributedSymbol)
     {
-        var loc = LocationForTypeIdentifier(type);
-        if (loc == null) loc = FirstLocationOf(attributedSymbol);
-        return Diagnostic.Create(NestedInGenericNotSupported, loc, type.ToDisplayString());
+        return Diagnostic.Create(NestedInGenericNotSupported, AnchorLocation(type, attributedSymbol), type.ToDisplayString());
+    }
+    
+    private static Location AnchorLocation(INamedTypeSymbol typeForFallback, ISymbol attributedSymbol)
+    {
+        if (attributedSymbol is INamedTypeSymbol)
+            return LocationForTypeIdentifier(typeForFallback) ?? FirstLocationOf(attributedSymbol);
+        return FirstLocationOf(attributedSymbol);
     }
 
     /// <summary>

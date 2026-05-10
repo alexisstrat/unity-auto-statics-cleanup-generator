@@ -1,3 +1,4 @@
+using System.Linq;
 using AutoStaticsCleanup.Tests.Utils;
 using Xunit;
 
@@ -295,7 +296,7 @@ public class Outer
     }
 
     [Fact]
-    public void TypeLevelAttributeOnNonPartialClassEmitsAsc001Once()
+    public void TypeLevelAttributeOnNonPartialClassEmitsOneAsc001OnTheTypeIdentifier()
     {
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
@@ -306,8 +307,36 @@ public class Foo
     public static int B;
 }";
         var diags = AnalyzerTestHelper.Run(src);
-        // One diagnostic emitted at the type level rather than one per member.
-        Assert.Single(diags, d => d.Id == "ASC001");
+        // One diagnostic at the type level (not one per member).
+        var asc001 = diags.Single(d => d.Id == "ASC001");
+
+        // Anchored on the class name, not on a member — so the code fix's
+        // "Add 'partial' to 'Foo'" lightbulb lands on the identifier being modified.
+        var span = asc001.Location.SourceSpan;
+        var text = asc001.Location.SourceTree!.GetText().ToString();
+        Assert.Equal("Foo", text.Substring(span.Start, span.Length));
+    }
+
+    [Fact]
+    public void MemberLevelAttributeAnchorsAsc001OnTheMember()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public static class StaticClassTest
+{
+    [AutoStaticsCleanup] public static int MyInt = 20;
+}";
+        var diags = AnalyzerTestHelper.Run(src);
+        var asc001 = diags.Single(d => d.Id == "ASC001");
+
+        var span = asc001.Location.SourceSpan;
+        var text = asc001.Location.SourceTree!.GetText().ToString();
+        var anchored = text.Substring(span.Start, span.Length);
+
+        // Field declarator's identifier is "MyInt"; without the fix this is
+        // "StaticClassTest" (the type identifier) and Rider hides it.
+        Assert.DoesNotContain("StaticClassTest", anchored);
+        Assert.Contains("MyInt", anchored);
     }
 
     [Fact]

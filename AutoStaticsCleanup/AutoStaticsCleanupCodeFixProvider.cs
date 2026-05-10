@@ -50,15 +50,26 @@ public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
     private static void RegisterAddPartial(
         CodeFixContext context, SyntaxNode root, SyntaxNode node, Diagnostic diagnostic)
     {
-        var typeDecl = node.FirstAncestorOrSelf<TypeDeclarationSyntax>();
-        if (typeDecl == null || HasPartialModifier(typeDecl)) return;
+        var offender = FirstNonPartialAncestor(node);
+        if (offender == null) return;
 
         context.RegisterCodeFix(
             CodeAction.Create(
-                title: $"Add 'partial' modifier to '{typeDecl.Identifier.ValueText}'",
-                createChangedDocument: ct => AddPartialAsync(context.Document, root, typeDecl, ct),
+                title: $"Add 'partial' modifier to '{offender.Identifier.ValueText}'",
+                createChangedDocument: ct => AddPartialAsync(context.Document, root, offender, ct),
                 equivalenceKey: "ASC001_AddPartial"),
             diagnostic);
+    }
+
+    private static TypeDeclarationSyntax FirstNonPartialAncestor(SyntaxNode node)
+    {
+        for (var current = node.FirstAncestorOrSelf<TypeDeclarationSyntax>();
+             current != null;
+             current = current.Parent?.FirstAncestorOrSelf<TypeDeclarationSyntax>())
+        {
+            if (!HasPartialModifier(current)) return current;
+        }
+        return null;
     }
 
     private static Task<Document> AddPartialAsync(
