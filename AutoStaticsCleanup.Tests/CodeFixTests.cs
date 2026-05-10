@@ -34,31 +34,4 @@ public class Outer
         Assert.Contains("public partial class Outer", fixed_);
     }
 
-    [Fact]
-    public void Asc002RemovesReadonlyModifier()
-    {
-        const string src = @"
-using Unity.Scripting.LifecycleManagement;
-public partial class Foo
-{
-    [AutoStaticsCleanup] public static readonly int Constant = 5;
-}";
-        var fixed_ = CodeFixTestHelper.ApplyFirstFix(src, "ASC002");
-        Assert.DoesNotContain("readonly", fixed_);
-        Assert.Contains("public static int Constant = 5;", fixed_);
-    }
-
-    [Fact]
-    public void Asc003AddsSetAccessorToGetOnlyAutoProperty()
-    {
-        const string src = @"
-using Unity.Scripting.LifecycleManagement;
-public partial class Foo
-{
-    [AutoStaticsCleanup] public static int Counter { get; } = 5;
-}";
-        var fixed_ = CodeFixTestHelper.ApplyFirstFix(src, "ASC003");
-        Assert.Contains("get;", fixed_);
-        Assert.Contains("set;", fixed_);
-    }
 }

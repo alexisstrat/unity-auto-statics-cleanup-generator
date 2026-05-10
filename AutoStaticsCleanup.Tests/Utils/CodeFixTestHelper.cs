@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -8,13 +9,14 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Diagnostics;
 
 namespace AutoStaticsCleanup.Tests.Utils;
 
 internal static class CodeFixTestHelper
 {
     /// <summary>
-    /// Runs the generator on <paramref name="userSource"/>, finds the first
+    /// Runs the analyzer on <paramref name="userSource"/>, finds the first
     /// diagnostic matching <paramref name="diagnosticId"/>, asks the code fix
     /// provider to register a fix, applies it, and returns the resulting
     /// document text.
@@ -38,15 +40,15 @@ internal static class CodeFixTestHelper
             refs,
             new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
 
-        var generator = new AutoStaticsCleanupGenerator();
-        GeneratorDriver driver = CSharpGeneratorDriver.Create(generator);
-        driver = driver.RunGenerators(compilation);
-        var diagnostic = driver.GetRunResult().Diagnostics.FirstOrDefault(d => d.Id == diagnosticId);
+        var analyzers = ImmutableArray.Create<DiagnosticAnalyzer>(new AutoStaticsCleanupAnalyzer());
+        var withAnalyzers = compilation.WithAnalyzers(analyzers);
+        var diagnostics = withAnalyzers.GetAnalyzerDiagnosticsAsync(CancellationToken.None).GetAwaiter().GetResult();
+        var diagnostic = diagnostics.FirstOrDefault(d => d.Id == diagnosticId);
         if (diagnostic == null)
-            throw new InvalidOperationException($"No diagnostic with id {diagnosticId} produced by generator");
+            throw new InvalidOperationException($"No diagnostic with id {diagnosticId} produced by analyzer");
 
-        // Diagnostics from the generator may target either tree; locate the
-        // tree the diagnostic actually points at and feed that to the workspace.
+        // Diagnostics may target either tree; locate the tree the diagnostic
+        // actually points at and feed that to the workspace.
         var targetTree = diagnostic.Location.SourceTree ?? userTree;
 
         using var workspace = new AdhocWorkspace();

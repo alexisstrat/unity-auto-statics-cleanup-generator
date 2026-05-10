@@ -9,16 +9,12 @@ using System.Threading;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Text;
 
 namespace AutoStaticsCleanup;
 
 [Generator]
 public class AutoStaticsCleanupGenerator : IIncrementalGenerator
 {
-    private const string AttributeFullName = "Unity.Scripting.LifecycleManagement.AutoStaticsCleanupAttribute";
-    private const string NoAttributeFullName = "Unity.Scripting.LifecycleManagement.NoAutoStaticsCleanupAttribute";
-
     // Names of symbols emitted into the generated file. Centralised so emission
     // and tests share a single source of truth.
     private const string CleanupBaseTypeFullName = "UnityEngine.PlayModeScopeAutoCleanup";
@@ -27,132 +23,10 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     private const string CompilerGeneratedAttr = "[System.Runtime.CompilerServices.CompilerGenerated]";
 
     // -----------------------------------------------------------------
-    //  Diagnostics
-    // -----------------------------------------------------------------
-
-    private static readonly DiagnosticDescriptor MustBePartial = new(
-        "ASC001",
-        "Type must be 'partial'",
-        "Type '{0}' must be declared 'partial' (and so must every enclosing type) to use [AutoStaticsCleanup]",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Error,
-        isEnabledByDefault: true);
-
-    private static readonly DiagnosticDescriptor ReadonlyNotSupported = new(
-        "ASC002",
-        "[AutoStaticsCleanup] cannot be applied to readonly fields",
-        "Field '{0}' is readonly; [AutoStaticsCleanup] requires a settable field",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Error,
-        isEnabledByDefault: true);
-
-    private static readonly DiagnosticDescriptor PropertyNeedsSetter = new(
-        "ASC003",
-        "[AutoStaticsCleanup] requires a property setter",
-        "Property '{0}' has no usable setter; [AutoStaticsCleanup] requires a settable property (init-only setters are not callable from Cleanup)",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Error,
-        isEnabledByDefault: true);
-
-    private static readonly DiagnosticDescriptor ManualEventNotSupported = new(
-        "ASC004",
-        "[AutoStaticsCleanup] does not support manual events",
-        "Event '{0}' has explicit 'add'/'remove' accessors; [AutoStaticsCleanup] only supports field-like events",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Error,
-        isEnabledByDefault: true);
-
-    private static readonly DiagnosticDescriptor NestedInGenericNotSupported = new(
-        "ASC005",
-        "[AutoStaticsCleanup] does not support types nested inside generic types",
-        "Type '{0}' is nested inside a generic type; closed generic instantiations cannot be discovered for cleanup",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Error,
-        isEnabledByDefault: true);
-
-    private static readonly DiagnosticDescriptor MemberMustBeStatic = new(
-        "ASC006",
-        "[AutoStaticsCleanup] requires a static member",
-        "Member '{0}' is not static; [AutoStaticsCleanup] only applies to static fields, properties, and events",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Warning,
-        isEnabledByDefault: true);
-
-    private static readonly DiagnosticDescriptor ConstFieldNotSupported = new(
-        "ASC007",
-        "[AutoStaticsCleanup] cannot be applied to const fields",
-        "Field '{0}' is const; const fields cannot be reset and [AutoStaticsCleanup] has no effect",
-        "AutoStaticsCleanup",
-        DiagnosticSeverity.Warning,
-        isEnabledByDefault: true);
-
-    // -----------------------------------------------------------------
     //  Cacheable models
     // -----------------------------------------------------------------
 
     private enum MemberKind : byte { Assign, Event }
-
-    private readonly struct LocationInfo : IEquatable<LocationInfo>
-    {
-        public string FilePath { get; init; }
-        public TextSpan Span { get; init; }
-        public LinePositionSpan LineSpan { get; init; }
-
-        public Location ToLocation() => Location.Create(FilePath ?? "", Span, LineSpan);
-
-        public bool Equals(LocationInfo other) =>
-            FilePath == other.FilePath && Span.Equals(other.Span) && LineSpan.Equals(other.LineSpan);
-
-        public override bool Equals(object obj) => obj is LocationInfo other && Equals(other);
-
-        public override int GetHashCode() =>
-            unchecked((FilePath?.GetHashCode() ?? 0) * 31 + Span.GetHashCode());
-
-        public static LocationInfo From(SyntaxReference syntaxRef)
-        {
-            if (syntaxRef == null) return default;
-            var loc = syntaxRef.GetSyntax().GetLocation();
-            return new LocationInfo
-            {
-                FilePath = loc.SourceTree?.FilePath ?? "",
-                Span = loc.SourceSpan,
-                LineSpan = loc.GetLineSpan().Span,
-            };
-        }
-    }
-
-    private readonly struct DiagnosticInfo : IEquatable<DiagnosticInfo>
-    {
-        public string DescriptorId { get; init; }
-        public string MessageArg { get; init; }
-        public LocationInfo Location { get; init; }
-
-        public bool Equals(DiagnosticInfo other) =>
-            DescriptorId == other.DescriptorId
-            && MessageArg == other.MessageArg
-            && Location.Equals(other.Location);
-
-        public override bool Equals(object obj) => obj is DiagnosticInfo other && Equals(other);
-
-        public override int GetHashCode() =>
-            unchecked((DescriptorId?.GetHashCode() ?? 0) * 31 + (MessageArg?.GetHashCode() ?? 0));
-
-        public Diagnostic ToDiagnostic()
-        {
-            var d = DescriptorId switch
-            {
-                "ASC001" => MustBePartial,
-                "ASC002" => ReadonlyNotSupported,
-                "ASC003" => PropertyNeedsSetter,
-                "ASC004" => ManualEventNotSupported,
-                "ASC005" => NestedInGenericNotSupported,
-                "ASC006" => MemberMustBeStatic,
-                "ASC007" => ConstFieldNotSupported,
-                _ => null,
-            };
-            return d == null ? null : Diagnostic.Create(d, Location.ToLocation(), MessageArg);
-        }
-    }
 
     /// <summary>
     /// One static member that needs resetting on a play-mode transition.
@@ -220,29 +94,29 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         }
     }
 
+    /// <summary>
+    /// Wrapper around <see cref="ImmutableArray{T}"/> with structural equality —
+    /// the incremental cache uses default <c>Equals</c> on the transform output,
+    /// and <c>ImmutableArray</c>'s default equality is reference-based, which
+    /// would invalidate the downstream pipeline on every run.
+    /// </summary>
     private readonly struct ExtractResult : IEquatable<ExtractResult>
     {
         public ImmutableArray<ResetEntry> Entries { get; init; }
-        public ImmutableArray<DiagnosticInfo> Diagnostics { get; init; }
 
-        public bool Equals(ExtractResult other) =>
-            ArrEquals(Entries, other.Entries) && ArrEquals(Diagnostics, other.Diagnostics);
-
-        public override bool Equals(object obj) => obj is ExtractResult other && Equals(other);
-
-        public override int GetHashCode() =>
-            unchecked((Entries.IsDefault ? 0 : Entries.Length) * 31
-                      + (Diagnostics.IsDefault ? 0 : Diagnostics.Length));
-
-        private static bool ArrEquals<T>(ImmutableArray<T> a, ImmutableArray<T> b) where T : IEquatable<T>
+        public bool Equals(ExtractResult other)
         {
-            if (a.IsDefault) return b.IsDefault;
-            if (b.IsDefault || a.Length != b.Length) return false;
-            for (var i = 0; i < a.Length; i++)
-                if (!a[i].Equals(b[i]))
+            if (Entries.IsDefault) return other.Entries.IsDefault;
+            if (other.Entries.IsDefault || Entries.Length != other.Entries.Length) return false;
+            for (var i = 0; i < Entries.Length; i++)
+                if (!Entries[i].Equals(other.Entries[i]))
                     return false;
             return true;
         }
+
+        public override bool Equals(object obj) => obj is ExtractResult other && Equals(other);
+
+        public override int GetHashCode() => Entries.IsDefault ? 0 : Entries.Length;
     }
 
     // -----------------------------------------------------------------
@@ -252,20 +126,9 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         var results = context.SyntaxProvider.ForAttributeWithMetadataName(
-            AttributeFullName,
+            Validation.AttributeFullName,
             predicate: static (_, _) => true,
             transform: static (ctx, ct) => Extract(ctx, ct));
-
-        // Diagnostics — emitted regardless of whether entries are present.
-        context.RegisterSourceOutput(results, static (spc, r) =>
-        {
-            if (r.Diagnostics.IsDefault) return;
-            foreach (var d in r.Diagnostics)
-            {
-                var diag = d.ToDiagnostic();
-                if (diag != null) spc.ReportDiagnostic(diag);
-            }
-        });
 
         // Source — collect, group by containing type, emit one file per group.
         // Roslyn's per-tree caching means an emitted file with byte-identical
@@ -358,49 +221,40 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     private static ExtractResult Extract(GeneratorAttributeSyntaxContext ctx, CancellationToken ct)
     {
         var entries = ImmutableArray.CreateBuilder<ResetEntry>();
-        var diags = ImmutableArray.CreateBuilder<DiagnosticInfo>();
         var compilation = ctx.SemanticModel.Compilation;
 
-        // Member-level dispatch: route every supported symbol kind into Add* so
-        // the methods can emit ASC006 / ASC007 / ASC004 for misuse instead of
-        // silently dropping the attribute.
+        // Member-level dispatch: route every supported symbol kind into Add*.
+        // Invalid shapes (non-static, const, manual-event, expression-bodied,
+        // readonly fields, etc.) are silently skipped here — the analyzer
+        // (AutoStaticsCleanupAnalyzer) is the source of truth for diagnostics.
         switch (ctx.TargetSymbol)
         {
             case INamedTypeSymbol type:
-                CollectTypeMembers(type, compilation, entries, diags, ct);
+                CollectTypeMembers(type, compilation, entries, ct);
                 break;
             case IFieldSymbol field:
-                AddField(entries, diags, field, compilation);
+                AddField(entries, field, compilation);
                 break;
             case IPropertySymbol prop when !prop.IsIndexer:
-                AddProperty(entries, diags, prop, compilation);
+                AddProperty(entries, prop, compilation);
                 break;
             case IEventSymbol evt:
-                AddEvent(entries, diags, evt, compilation);
+                AddEvent(entries, evt, compilation);
                 break;
         }
 
-        return new ExtractResult
-        {
-            Entries = entries.ToImmutable(),
-            Diagnostics = diags.ToImmutable(),
-        };
+        return new ExtractResult { Entries = entries.ToImmutable() };
     }
 
     private static void CollectTypeMembers(
         INamedTypeSymbol typeSymbol,
         Compilation compilation,
         ImmutableArray<ResetEntry>.Builder entries,
-        ImmutableArray<DiagnosticInfo>.Builder diags,
         CancellationToken ct)
     {
-        // Verify the partial chain once at the type level — if it fails, every
-        // member would emit the same diagnostic, which is just noise.
-        if (!IsPartialChain(typeSymbol))
-        {
-            diags.Add(MakePartialDiagnostic(typeSymbol, typeSymbol));
-            return;
-        }
+        // Verify the partial chain once at the type level — if it fails, emit
+        // nothing for any member (analyzer reports the diagnostic separately).
+        if (!Validation.IsPartialChain(typeSymbol)) return;
 
         // Precompute the type-level facts once and pass them through. Without
         // this, every static member of a type with N attributed members would
@@ -412,18 +266,18 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         foreach (var member in typeSymbol.GetMembers())
         {
             ct.ThrowIfCancellationRequested();
-            if (HasAttribute(member, NoAttributeFullName)) continue;
+            if (Validation.HasAttribute(member, Validation.NoAttributeFullName)) continue;
 
             switch (member)
             {
                 case IFieldSymbol { IsStatic: true, IsConst: false, IsImplicitlyDeclared: false } f:
-                    AddField(entries, diags, f, compilation, ctx, usingsCache);
+                    AddField(entries, f, compilation, ctx, usingsCache);
                     break;
                 case IPropertySymbol { IsStatic: true, IsIndexer: false, IsImplicitlyDeclared: false } p:
-                    AddProperty(entries, diags, p, compilation, ctx, usingsCache);
+                    AddProperty(entries, p, compilation, ctx, usingsCache);
                     break;
                 case IEventSymbol { IsStatic: true, IsImplicitlyDeclared: false } e:
-                    AddEvent(entries, diags, e, compilation, ctx, usingsCache);
+                    AddEvent(entries, e, compilation, ctx, usingsCache);
                     break;
             }
         }
@@ -431,11 +285,9 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
 
     /// <summary>
     /// Cached type-level facts shared by every member of a type during a
-    /// type-level scan. <see cref="ContainingTypeKey"/>, <see cref="Namespace"/>,
-    /// <see cref="PartialChain"/>, <see cref="SelfTypeDecl"/>, and
-    /// <see cref="HasGenericOuter"/> all depend only on the containing type, so
-    /// computing them once per scan instead of once per member halves the
-    /// extraction cost in the common type-level path.
+    /// type-level scan. The four fields all depend only on the containing
+    /// type, so computing them once per scan instead of once per member
+    /// halves the extraction cost in the common type-level path.
     /// </summary>
     private readonly struct TypeContext
     {
@@ -443,7 +295,6 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         public string Namespace { get; init; }
         public ImmutableArray<string> PartialChain { get; init; }
         public string SelfTypeDecl { get; init; }
-        public bool HasGenericOuter { get; init; }
 
         public static TypeContext For(INamedTypeSymbol type) => new()
         {
@@ -451,7 +302,6 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             Namespace = NamespaceOf(type),
             PartialChain = BuildPartialChain(type),
             SelfTypeDecl = TypeDecl(type),
-            HasGenericOuter = AutoStaticsCleanupGenerator.HasGenericOuter(type),
         };
     }
 
@@ -469,49 +319,19 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
 
     private static void AddField(
         ImmutableArray<ResetEntry>.Builder entries,
-        ImmutableArray<DiagnosticInfo>.Builder diags,
         IFieldSymbol field,
         Compilation compilation,
         TypeContext? ctx = null,
         Dictionary<SyntaxTree, ImmutableArray<string>> usingsCache = null)
     {
-        if (!field.IsStatic)
-        {
-            diags.Add(MakeMemberDiagnostic("ASC006", field));
-            return;
-        }
-
-        if (field.IsConst)
-        {
-            diags.Add(MakeMemberDiagnostic("ASC007", field));
-            return;
-        }
+        if (!field.IsStatic) return;
+        if (field.IsConst) return;
+        if (field.IsReadOnly) return;
 
         var owner = field.ContainingType;
         var c = ctx ?? TypeContext.For(owner);
 
-        if (c.HasGenericOuter)
-        {
-            diags.Add(MakeNestedInGenericDiagnostic(owner, field));
-            return;
-        }
-
-        if (!IsPartialChain(owner))
-        {
-            diags.Add(MakePartialDiagnostic(owner, field));
-            return;
-        }
-
-        if (field.IsReadOnly)
-        {
-            diags.Add(new DiagnosticInfo
-            {
-                DescriptorId = "ASC002",
-                MessageArg = field.Name,
-                Location = LocationInfo.From(field.DeclaringSyntaxReferences.FirstOrDefault()),
-            });
-            return;
-        }
+        if (!Validation.IsPartialChain(owner)) return;
 
         var (initText, initNs) = GetFieldInitializer(field, compilation);
         entries.Add(new ResetEntry
@@ -532,49 +352,25 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
 
     private static void AddProperty(
         ImmutableArray<ResetEntry>.Builder entries,
-        ImmutableArray<DiagnosticInfo>.Builder diags,
         IPropertySymbol prop,
         Compilation compilation,
         TypeContext? ctx = null,
         Dictionary<SyntaxTree, ImmutableArray<string>> usingsCache = null)
     {
-        if (!prop.IsStatic)
-        {
-            diags.Add(MakeMemberDiagnostic("ASC006", prop));
-            return;
-        }
+        if (!prop.IsStatic) return;
 
         // Expression-bodied properties carry no state.
         if (prop.DeclaringSyntaxReferences.Length > 0
             && prop.DeclaringSyntaxReferences[0].GetSyntax() is PropertyDeclarationSyntax { ExpressionBody: not null })
             return;
 
+        // No setter, or init-only setter — can't be reset from Cleanup().
+        if (prop.SetMethod == null || prop.SetMethod.IsInitOnly) return;
+
         var owner = prop.ContainingType;
         var c = ctx ?? TypeContext.For(owner);
 
-        if (c.HasGenericOuter)
-        {
-            diags.Add(MakeNestedInGenericDiagnostic(owner, prop));
-            return;
-        }
-
-        if (!IsPartialChain(owner))
-        {
-            diags.Add(MakePartialDiagnostic(owner, prop));
-            return;
-        }
-
-        // No setter, or init-only setter — can't be reset from Cleanup().
-        if (prop.SetMethod == null || prop.SetMethod.IsInitOnly)
-        {
-            diags.Add(new DiagnosticInfo
-            {
-                DescriptorId = "ASC003",
-                MessageArg = prop.Name,
-                Location = LocationInfo.From(prop.DeclaringSyntaxReferences.FirstOrDefault()),
-            });
-            return;
-        }
+        if (!Validation.IsPartialChain(owner)) return;
 
         var (initText, initNs) = GetPropertyInitializer(prop, compilation);
         entries.Add(new ResetEntry
@@ -595,41 +391,22 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
 
     private static void AddEvent(
         ImmutableArray<ResetEntry>.Builder entries,
-        ImmutableArray<DiagnosticInfo>.Builder diags,
         IEventSymbol evt,
         Compilation compilation,
         TypeContext? ctx = null,
         Dictionary<SyntaxTree, ImmutableArray<string>> usingsCache = null)
     {
-        if (!evt.IsStatic)
-        {
-            diags.Add(MakeMemberDiagnostic("ASC006", evt));
-            return;
-        }
+        if (!evt.IsStatic) return;
 
         // Manual events (with explicit add/remove) — Evt.GetInvocationList()
         // doesn't compile because Evt isn't a delegate field outside the
         // declaring scope of a field-like event.
-        if (!IsFieldLikeEvent(evt))
-        {
-            diags.Add(MakeMemberDiagnostic("ASC004", evt));
-            return;
-        }
+        if (!Validation.IsFieldLikeEvent(evt)) return;
 
         var owner = evt.ContainingType;
         var c = ctx ?? TypeContext.For(owner);
 
-        if (c.HasGenericOuter)
-        {
-            diags.Add(MakeNestedInGenericDiagnostic(owner, evt));
-            return;
-        }
-
-        if (!IsPartialChain(owner))
-        {
-            diags.Add(MakePartialDiagnostic(owner, evt));
-            return;
-        }
+        if (!Validation.IsPartialChain(owner)) return;
 
         entries.Add(new ResetEntry
         {
@@ -648,96 +425,6 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     // -----------------------------------------------------------------
     //  Symbol helpers
     // -----------------------------------------------------------------
-
-    private static DiagnosticInfo MakePartialDiagnostic(INamedTypeSymbol type, ISymbol attributedSymbol)
-    {
-        // Walk to the first non-partial type in the chain so the message points at the offender.
-        INamedTypeSymbol offender = type;
-        for (var t = type; t != null; t = t.ContainingType)
-            if (!IsPartial(t))
-                offender = t;
-
-        // Locate the offender's declaration so the squiggly lands on the type
-        // identifier (lets the code fix add `partial` precisely there). Falls
-        // back to the attributed symbol when the type has no syntax (metadata).
-        var offenderRef = offender.DeclaringSyntaxReferences.FirstOrDefault();
-        var loc = offenderRef != null
-            ? LocationInfoForTypeIdentifier(offenderRef)
-            : LocationInfo.From(attributedSymbol.DeclaringSyntaxReferences.FirstOrDefault());
-
-        return new DiagnosticInfo
-        {
-            DescriptorId = "ASC001",
-            MessageArg = offender.ToDisplayString(),
-            Location = loc,
-        };
-    }
-
-    private static LocationInfo LocationInfoForTypeIdentifier(SyntaxReference typeRef)
-    {
-        if (typeRef.GetSyntax() is TypeDeclarationSyntax tds)
-        {
-            var loc = tds.Identifier.GetLocation();
-            return new LocationInfo
-            {
-                FilePath = loc.SourceTree?.FilePath ?? "",
-                Span = loc.SourceSpan,
-                LineSpan = loc.GetLineSpan().Span,
-            };
-        }
-        return LocationInfo.From(typeRef);
-    }
-
-    private static bool IsPartialChain(INamedTypeSymbol type)
-    {
-        for (var t = type; t != null; t = t.ContainingType)
-            if (!IsPartial(t))
-                return false;
-        return true;
-    }
-
-    private static bool HasGenericOuter(INamedTypeSymbol type)
-    {
-        for (var t = type.ContainingType; t != null; t = t.ContainingType)
-            if (t.IsGenericType)
-                return true;
-        return false;
-    }
-
-    private static bool IsFieldLikeEvent(IEventSymbol evt) =>
-        evt.AddMethod?.IsImplicitlyDeclared ?? true;
-
-    private static DiagnosticInfo MakeMemberDiagnostic(string id, ISymbol member) =>
-        new()
-        {
-            DescriptorId = id,
-            MessageArg = member.Name,
-            Location = LocationInfo.From(member.DeclaringSyntaxReferences.FirstOrDefault()),
-        };
-
-    private static DiagnosticInfo MakeNestedInGenericDiagnostic(INamedTypeSymbol type, ISymbol attributedSymbol)
-    {
-        var typeRef = type.DeclaringSyntaxReferences.FirstOrDefault();
-        var loc = typeRef != null
-            ? LocationInfoForTypeIdentifier(typeRef)
-            : LocationInfo.From(attributedSymbol.DeclaringSyntaxReferences.FirstOrDefault());
-        return new DiagnosticInfo
-        {
-            DescriptorId = "ASC005",
-            MessageArg = type.ToDisplayString(),
-            Location = loc,
-        };
-    }
-
-    private static bool IsPartial(INamedTypeSymbol type)
-    {
-        foreach (var sr in type.DeclaringSyntaxReferences)
-            if (sr.GetSyntax() is TypeDeclarationSyntax tds)
-                foreach (var mod in tds.Modifiers)
-                    if (mod.IsKind(SyntaxKind.PartialKeyword))
-                        return true;
-        return false;
-    }
 
     /// <summary>
     /// True when a `default` write should be guarded with `is not null`.
@@ -894,14 +581,6 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             sb.Append(c == '\r' || c == '\n' ? ' ' : c);
         }
         return sb.ToString();
-    }
-
-    private static bool HasAttribute(ISymbol symbol, string fullName)
-    {
-        foreach (var attr in symbol.GetAttributes())
-            if (attr.AttributeClass?.ToDisplayString() == fullName)
-                return true;
-        return false;
     }
 
     // -----------------------------------------------------------------

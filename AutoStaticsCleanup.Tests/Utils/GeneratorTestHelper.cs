@@ -40,16 +40,9 @@ namespace System.Runtime.CompilerServices
     /// this; tests that need per-file inspection should call <see cref="RunFiles"/>.
     /// </summary>
     public static string RunGenerator(string userSource) =>
-        string.Join("\n\n", RunFiles(userSource).Files.Select(f => f.Source));
+        string.Join("\n\n", RunFiles(userSource).Select(f => f.Source));
 
-    public static (string Source, ImmutableArray<Diagnostic> Diagnostics) Run(string userSource)
-    {
-        var r = RunFiles(userSource);
-        var combined = string.Join("\n\n", r.Files.Select(f => f.Source));
-        return (combined, r.Diagnostics);
-    }
-
-    public static (ImmutableArray<(string FileName, string Source)> Files, ImmutableArray<Diagnostic> Diagnostics) RunFiles(string userSource)
+    public static ImmutableArray<(string FileName, string Source)> RunFiles(string userSource)
     {
         var trustedAssemblies = (string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!;
         var refs = trustedAssemblies
@@ -74,10 +67,9 @@ namespace System.Runtime.CompilerServices
         driver = driver.RunGenerators(compilation);
 
         var result = driver.GetRunResult();
-        var files = result.Results
+        return result.Results
             .SelectMany(r => r.GeneratedSources)
             .Select(s => (s.HintName, s.SourceText.ToString()))
             .ToImmutableArray();
-        return (files, result.Diagnostics);
     }
 }
