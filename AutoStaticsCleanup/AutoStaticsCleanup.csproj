@@ -4,6 +4,16 @@
         <TargetFramework>netstandard2.0</TargetFramework>
         <LangVersion>latest</LangVersion>
         <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+
+        <Version>1.0.0</Version>
+        <AssemblyVersion>1.0.0.0</AssemblyVersion>
+        <FileVersion>1.0.0.0</FileVersion>
+        <Authors>Alexandros Stratakis</Authors>
+        <Copyright>Copyright (c) 2026 Alexandros Stratakis</Copyright>
+        <Description>Backport of Unity 6.5+'s AutoStaticsCleanup source generator to Unity 6.0–6.4.</Description>
+        <RepositoryUrl>https://github.com/alexisstrat/unity-auto-statics-cleanup-generator</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
     </PropertyGroup>
 
     <ItemGroup>
