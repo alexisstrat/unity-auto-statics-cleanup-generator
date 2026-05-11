@@ -170,6 +170,74 @@ public partial class Bag<T> where T : IDisposable, new()
         var output = Run(src);
         Assert.Contains("_x.Dispose();", output);
     }
+
+    [Fact]
+    public void ReadonlyCollectionWithClearAndTrivialInitEmitsClear()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly List<int> Items = new();
+}";
+        var output = Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
+        Assert.Contains("Items.Clear();", output);
+        Assert.DoesNotContain("Items =", output);
+    }
+
+    [Fact]
+    public void ReadonlyCollectionWithExplicitTypeArgsAndTrivialInitEmitsClear()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly Dictionary<string, int> Map = new Dictionary<string, int>();
+}";
+        var output = Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
+        Assert.Contains("Map.Clear();", output);
+    }
+
+    [Fact]
+    public void ReadonlyCollectionWithCollectionInitializerEmitsAsc002AndIsSkipped()
+    {
+        // Non-trivial initializer ({ 1, 2, 3 }) — Clear() would empty the list,
+        // not restore [1,2,3]. ASC002 warns; the field is skipped from output.
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly List<int> Items = new() { 1, 2, 3 };
+}";
+        var output = Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC002");
+        Assert.DoesNotContain("Items", output);
+    }
+
+    [Fact]
+    public void ReadonlyUserWrapperWithClearAndTrivialInitEmitsClear()
+    {
+        // Any user type exposing public parameterless void Clear() qualifies.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public class Wrapper { public void Clear() {} }
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly Wrapper W = new();
+}";
+        var output = Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
+        Assert.Contains("W.Clear();", output);
+    }
 }
 
 public class PropertyTests

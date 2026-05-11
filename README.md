@@ -211,7 +211,7 @@ Only `ASC001` ships with a quick-fix; the warnings are diagnostic-only — chang
 | ID | Severity | When | Quick fix |
 |---|---|---|---|
 | `ASC001` | Error | The attributed type (or any enclosing type) is not declared `partial`, and the generator would otherwise emit code for at least one member. | Add `partial` modifier to the offending type. |
-| `ASC002` | Warning | Member-level `[AutoStaticsCleanup]` on a `readonly` field — `readonly` blocks the reassignment the generator would emit, so the attribute is ignored. | — |
+| `ASC002` | Warning | Member-level `[AutoStaticsCleanup]` on a `readonly` field that can't be reset — either the type has no `Clear()` method or the initializer is non-trivial (e.g., `new() { 1, 2, 3 }`). Readonly + `Clear()` + trivial init (`new()`, `new T()`) is supported and emits a `Clear()` call instead. | — |
 | `ASC003` | Warning | Member-level on a property without a settable setter (get-only, init-only) — the generator can't reset it, so the attribute is ignored. | — |
 | `ASC004` | Warning | Member-level on a manual event (explicit `add`/`remove`) — the unsubscribe loop needs the compiler-generated backing field, so the attribute is ignored. | — |
 | `ASC006` | Warning | Member-level on an instance member — only static state is cleaned up; the attribute is ignored. | — |
@@ -221,6 +221,12 @@ Only `ASC001` ships with a quick-fix; the warnings are diagnostic-only — chang
 ### IDisposable fields and properties
 
 When an attributed field or property's type implements `System.IDisposable` (directly, transitively, or via a generic constraint) and there's an initializer to reassign to, the generator emits `field?.Dispose()` before the reassignment. This handles `Stream`, `HttpClient`, and any user `IDisposable` implementation without leaking the previous instance on play-mode transitions.
+
+### Readonly collections with `Clear()`
+
+`static readonly` fields are normally unreachable for cleanup (the generator can't reassign them). When the field type exposes a public parameterless `Clear()` method **and** the initializer is trivial (`new()`, `new T()`, `null`, `default`), the generator emits `field.Clear();` instead — empties the container in place while keeping the reference stable. Covers `List<T>`, `Dictionary<K,V>`, `HashSet<T>`, `Queue<T>`, `Stack<T>`, `ConcurrentDictionary<K,V>`, and any user wrapper with a matching `Clear()`.
+
+Non-trivial initializers like `new() { 1, 2, 3 }` are intentionally rejected (ASC002) because `Clear()` would empty the collection rather than restore the original elements — Unity's source generator treats this the same way.
 
 ## How it works
 
