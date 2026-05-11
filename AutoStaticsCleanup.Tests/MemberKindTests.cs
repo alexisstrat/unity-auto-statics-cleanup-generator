@@ -1,5 +1,6 @@
 using System.Linq;
 using AutoStaticsCleanup.Tests.Utils;
+using Microsoft.CodeAnalysis;
 using Xunit;
 
 namespace AutoStaticsCleanup.Tests;
@@ -158,9 +159,8 @@ public partial class Foo
     }
 
     [Fact]
-    public void GetOnlyAutoPropertyIsSilentlySkipped()
+    public void GetOnlyAutoPropertyEmitsAsc003AndIsSkipped()
     {
-        // Unity 6.5 emits no diagnostic and just drops the property — match.
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
 public partial class Foo
@@ -169,7 +169,8 @@ public partial class Foo
 }";
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
-        Assert.Empty(diags);
+        var asc003 = diags.Single(d => d.Id == "ASC003");
+        Assert.Equal(DiagnosticSeverity.Warning, asc003.Severity);
         Assert.DoesNotContain("Counter", output);
     }
 
@@ -234,7 +235,7 @@ public partial class Foo
 public class ReadonlyFieldTests
 {
     [Fact]
-    public void MemberLevelReadonlyFieldEmitsNoDiagnosticAndIsSkipped()
+    public void MemberLevelReadonlyFieldEmitsAsc002AndIsSkipped()
     {
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
@@ -244,28 +245,14 @@ public partial class Foo
 }";
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
-        Assert.Empty(diags);
+        var asc002 = diags.Single(d => d.Id == "ASC002");
+        Assert.Equal(DiagnosticSeverity.Warning, asc002.Severity);
         Assert.DoesNotContain("Constant", output);
     }
 }
 
 public class PartialDiagnosticTests
 {
-    [Fact]
-    public void NonPartialClassEmitsAsc001()
-    {
-        const string src = @"
-using Unity.Scripting.LifecycleManagement;
-public class Foo
-{
-    [AutoStaticsCleanup] public static int Counter;
-}";
-        var output = GeneratorTestHelper.RunGenerator(src);
-        var diags = AnalyzerTestHelper.Run(src);
-        Assert.Contains(diags, d => d.Id == "ASC001");
-        Assert.DoesNotContain("Counter", output);
-    }
-
     [Fact]
     public void NonPartialOuterClassEmitsAsc001ForNestedTarget()
     {
@@ -294,36 +281,36 @@ public class Foo
     public static int B;
 }";
         var diags = AnalyzerTestHelper.Run(src);
-        // One diagnostic at the type level (not one per member).
         var asc001 = diags.Single(d => d.Id == "ASC001");
 
-        // Anchored on the class name, not on a member — so the code fix's
-        // "Add 'partial' to 'Foo'" lightbulb lands on the identifier being modified.
         var span = asc001.Location.SourceSpan;
         var text = asc001.Location.SourceTree!.GetText().ToString();
         Assert.Equal("Foo", text.Substring(span.Start, span.Length));
     }
 
     [Fact]
-    public void MemberLevelAttributeAnchorsAsc001OnTheMember()
+    public void MemberLevelAsc001IsAnchoredOnMemberAndCodegenSkips()
     {
+        // Anchor on the member, not on the type identifier — Rider's
+        // incremental analyzer hides diagnostics whose location is outside
+        // the syntactic scope of the symbol being analyzed.
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
 public static class StaticClassTest
 {
     [AutoStaticsCleanup] public static int MyInt = 20;
 }";
+        var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         var asc001 = diags.Single(d => d.Id == "ASC001");
 
         var span = asc001.Location.SourceSpan;
         var text = asc001.Location.SourceTree!.GetText().ToString();
         var anchored = text.Substring(span.Start, span.Length);
-
-        // Field declarator's identifier is "MyInt"; without the fix this is
-        // "StaticClassTest" (the type identifier) and Rider hides it.
         Assert.DoesNotContain("StaticClassTest", anchored);
         Assert.Contains("MyInt", anchored);
+
+        Assert.DoesNotContain("MyInt", output);
     }
 
     [Fact]
@@ -347,28 +334,108 @@ public partial class Outer
     }
 }
 
-/// <summary>
-/// All "wrong shape" attribute placements (instance member, const, manual
-/// event, get-only/expression-bodied/init-only property) are silently
-/// skipped by both analyzer and generator — matches Unity 6.5 exactly.
-/// One regression net for all of them, since they share the same shape.
-/// </summary>
-public class UnityParitySilentSkipTests
+public class MemberLevelWarningTests
 {
-    [Theory]
-    [InlineData("public partial class Foo { [AutoStaticsCleanup] public int Counter; }")]
-    [InlineData("public partial class Foo { [AutoStaticsCleanup] public int Counter { get; set; } }")]
-    [InlineData("public partial class Bus { [AutoStaticsCleanup] public event System.Action OnSomething; }")]
-    [InlineData("public partial class Foo { [AutoStaticsCleanup] public const int Magic = 42; }")]
-    [InlineData("public partial class Foo { [AutoStaticsCleanup] public static readonly int X = 5; }")]
-    [InlineData("public partial class Bus { private static System.Action _b; [AutoStaticsCleanup] public static event System.Action E { add { _b += value; } remove { _b -= value; } } }")]
-    public void MemberLevelMisuseEmitsNoDiagnostic(string declaration)
+    [Fact]
+    public void InstanceFieldEmitsAsc006()
     {
-        var src = "using Unity.Scripting.LifecycleManagement;\n" + declaration;
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public int Counter;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        var asc006 = diags.Single(d => d.Id == "ASC006");
+        Assert.Equal(DiagnosticSeverity.Warning, asc006.Severity);
+        Assert.DoesNotContain("Counter", output);
+    }
+
+    [Fact]
+    public void InstancePropertyEmitsAsc006()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public int Counter { get; set; }
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        var asc006 = diags.Single(d => d.Id == "ASC006");
+        Assert.Equal(DiagnosticSeverity.Warning, asc006.Severity);
+        Assert.DoesNotContain("Counter", output);
+    }
+
+    [Fact]
+    public void InstanceEventEmitsAsc006()
+    {
+        const string src = @"
+using System;
+using Unity.Scripting.LifecycleManagement;
+public partial class Bus
+{
+    [AutoStaticsCleanup] public event Action OnSomething;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        var asc006 = diags.Single(d => d.Id == "ASC006");
+        Assert.Equal(DiagnosticSeverity.Warning, asc006.Severity);
+        Assert.DoesNotContain("OnSomething", output);
+    }
+
+    [Fact]
+    public void ConstFieldEmitsAsc007()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public const int Magic = 42;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        var asc007 = diags.Single(d => d.Id == "ASC007");
+        Assert.Equal(DiagnosticSeverity.Warning, asc007.Severity);
+        Assert.DoesNotContain("Magic", output);
+    }
+
+    [Fact]
+    public void ManualEventEmitsAsc004()
+    {
+        const string src = @"
+using System;
+using Unity.Scripting.LifecycleManagement;
+public partial class Bus
+{
+    private static Action _backing;
+    [AutoStaticsCleanup]
+    public static event Action OnSomething { add { _backing += value; } remove { _backing -= value; } }
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        var asc004 = diags.Single(d => d.Id == "ASC004");
+        Assert.Equal(DiagnosticSeverity.Warning, asc004.Severity);
+        Assert.DoesNotContain("OnSomething", output);
+    }
+
+    [Fact]
+    public void NoAutoStaticsCleanupSuppressesWarningOnDoubleMarkedMember()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup, NoAutoStaticsCleanup] public static readonly int Constant = 5;
+}";
         var diags = AnalyzerTestHelper.Run(src);
         Assert.Empty(diags);
     }
+}
 
+public class TypeLevelSilentSkipTests
+{
     [Fact]
     public void TypeLevelScanSilentlySkipsInstanceConstReadonlyAndManualEvent()
     {
@@ -388,7 +455,6 @@ public partial class Foo
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         Assert.Empty(diags);
-        // Only the resettable static field survives.
         Assert.Contains("Counter = default;", output);
         Assert.DoesNotContain("Magic", output);
         Assert.DoesNotContain("Instance", output);
@@ -397,12 +463,6 @@ public partial class Foo
     }
 }
 
-/// <summary>
-/// Unity 6.5 emits cleanup code for types nested inside a generic outer.
-/// We match that — no analyzer diagnostic, generator emits the partial
-/// extension. The runtime caveat (closed instantiations only register
-/// when their static constructor runs) is documentation territory.
-/// </summary>
 public class NestedInGenericTests
 {
     [Fact]

@@ -10,12 +10,24 @@ namespace AutoStaticsCleanup;
 /// — the IDE surfaces these rules even when the generator isn't producing
 /// output, and they show up under Solution Explorer's analyzer node with
 /// proper severity-config affordances.
+///
+/// Member-level [AutoStaticsCleanup] runs full shape validation (ASC002-007
+/// fire when the explicitly attributed member can't actually be reset).
+/// Type-level [AutoStaticsCleanup] only verifies the partial chain (ASC001);
+/// unfit members on a class-level scan are silently filtered to match the
+/// Unity 6.5 source generator's behavior.
 /// </summary>
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
 public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
 {
     public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics { get; } =
-        ImmutableArray.Create(Validation.MustBePartial);
+        ImmutableArray.Create(
+            Validation.MustBePartial,
+            Validation.ReadonlyNotSupported,
+            Validation.PropertyNeedsSetter,
+            Validation.ManualEventNotSupported,
+            Validation.MemberMustBeStatic,
+            Validation.ConstFieldNotSupported);
 
     public override void Initialize(AnalysisContext context)
     {
@@ -44,10 +56,16 @@ public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
         var symbol = context.Symbol;
         if (!Validation.HasAttribute(symbol, attr)) return;
 
+        // A member double-marked with [NoAutoStaticsCleanup] is an explicit opt-out;
+        // suppress the warning even though the user also attached [AutoStaticsCleanup].
+        // Matches what the generator does for the type-level walk.
+        if (symbol is not INamedTypeSymbol
+            && noAttr != null && Validation.HasAttribute(symbol, noAttr)) return;
+
         switch (symbol)
         {
             case INamedTypeSymbol type:
-                AnalyzeType(context, type, noAttr);
+                AnalyzeType(context, type);
                 break;
             case IFieldSymbol field:
                 Report(context, Validation.ValidateField(field));
@@ -62,36 +80,17 @@ public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>
-    /// Type-level [AutoStaticsCleanup] dispatch: verify the partial chain once
-    /// (so a non-partial type produces a single diagnostic, not one per
-    /// member), then run per-member validators on every static field/property/
-    /// event that wasn't explicitly opted out.
+    /// Type-level [AutoStaticsCleanup] dispatch: only verify the partial chain.
+    /// Unfit members (instance, const, readonly, manual event, etc.) are
+    /// silently filtered by the generator at codegen time; we don't warn on
+    /// them at the type-level scan because the user's mental model is "reset
+    /// what's resettable, leave the rest alone." Warnings are reserved for
+    /// explicit member-level attribution.
     /// </summary>
-    private static void AnalyzeType(SymbolAnalysisContext context, INamedTypeSymbol type, INamedTypeSymbol noAttr)
+    private static void AnalyzeType(SymbolAnalysisContext context, INamedTypeSymbol type)
     {
         if (!Validation.IsPartialChain(type))
-        {
             context.ReportDiagnostic(Validation.CreatePartialDiagnostic(type, type));
-            return;
-        }
-
-        foreach (var member in type.GetMembers())
-        {
-            if (noAttr != null && Validation.HasAttribute(member, noAttr)) continue;
-
-            switch (member)
-            {
-                case IFieldSymbol { IsStatic: true, IsConst: false, IsImplicitlyDeclared: false } f:
-                    Report(context, Validation.ValidateField(f));
-                    break;
-                case IPropertySymbol { IsStatic: true, IsIndexer: false, IsImplicitlyDeclared: false } p:
-                    Report(context, Validation.ValidateProperty(p));
-                    break;
-                case IEventSymbol { IsStatic: true, IsImplicitlyDeclared: false } e:
-                    Report(context, Validation.ValidateEvent(e));
-                    break;
-            }
-        }
     }
 
     private static void Report(SymbolAnalysisContext context, Diagnostic diagnostic)
