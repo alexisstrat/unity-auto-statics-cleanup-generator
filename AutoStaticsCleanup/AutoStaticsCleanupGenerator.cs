@@ -43,6 +43,7 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         public string DelegateTypeFq { get; init; }
         public bool RequiresGuard { get; init; }
         public bool RequiresDispose { get; init; }
+        public bool RequiresClear { get; init; }
         public string Initializer { get; init; }
         public int SourceOrder { get; init; }
         public ImmutableArray<string> FileUsings { get; init; }
@@ -65,6 +66,7 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             DelegateTypeFq == other.DelegateTypeFq &&
             RequiresGuard == other.RequiresGuard &&
             RequiresDispose == other.RequiresDispose &&
+            RequiresClear == other.RequiresClear &&
             Initializer == other.Initializer &&
             SourceOrder == other.SourceOrder &&
             ChainEquals(FileUsings, other.FileUsings) &&
@@ -374,7 +376,12 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     {
         if (!field.IsStatic) return;
         if (field.IsConst) return;
-        if (field.IsReadOnly) return;
+
+        // Readonly fields are skipped unless they qualify for the Clear strategy:
+        // type has a public parameterless Clear() AND the initializer is trivial
+        // (so Clear()'s "empty container" result matches the original state).
+        var canCleanReadonly = field.IsReadOnly && Validation.CanCleanReadonlyField(field);
+        if (field.IsReadOnly && !canCleanReadonly) return;
 
         var owner = field.ContainingType;
         var c = ctx ?? TypeContext.For(owner);
@@ -391,7 +398,10 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             MemberName = field.Name,
             Kind = MemberKind.Assign,
             RequiresGuard = TypeRequiresGuard(field.Type),
-            RequiresDispose = initText != null && Validation.ImplementsIDisposable(field.Type),
+            RequiresDispose = !canCleanReadonly
+                              && initText != null
+                              && Validation.ImplementsIDisposable(field.Type),
+            RequiresClear = canCleanReadonly,
             Initializer = initText,
             InitializerNamespaces = initNs,
             SourceOrder = SourceOrderOf(field),
@@ -819,6 +829,15 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
 
     private static void EmitAssign(IndentedTextWriter w, ResetEntry e)
     {
+        if (e.RequiresClear)
+        {
+            // Readonly + Clear() strategy: empty the container in place.
+            // Trivial-initializer gate (checked in CanCleanReadonlyField)
+            // guarantees the original state matches Clear()'s post-state.
+            w.WriteLine($"{e.MemberName}.Clear();");
+            return;
+        }
+
         var rhs = e.Initializer ?? "default";
         if (e.RequiresDispose)
         {

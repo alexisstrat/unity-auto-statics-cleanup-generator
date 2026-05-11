@@ -38,8 +38,8 @@ internal static class Validation
 
     public static readonly DiagnosticDescriptor ReadonlyNotSupported = new(
         "ASC002",
-        "[AutoStaticsCleanup] cannot be applied to readonly fields",
-        "Field '{0}' is readonly; [AutoStaticsCleanup] requires a settable field, so the attribute will be ignored",
+        "[AutoStaticsCleanup] readonly field cannot be reset",
+        "Field '{0}' is readonly; reset requires either a settable field or a type with a public Clear() method AND a trivial initializer (e.g., 'new()'). The attribute will be ignored.",
         "AutoStaticsCleanup",
         DiagnosticSeverity.Warning,
         isEnabledByDefault: true);
@@ -149,6 +149,72 @@ internal static class Validation
         return false;
     }
 
+    /// <summary>
+    /// True if <paramref name="type"/> has a public, parameterless, void
+    /// instance method named <c>Clear</c>. Covers the standard collection
+    /// types (<c>List&lt;T&gt;</c>, <c>Dictionary&lt;K,V&gt;</c>,
+    /// <c>HashSet&lt;T&gt;</c>, …) and any user wrapper that exposes one.
+    /// </summary>
+    public static bool HasClearMethod(ITypeSymbol type)
+    {
+        if (type == null) return false;
+        foreach (var m in type.GetMembers("Clear"))
+            if (m is IMethodSymbol method
+                && !method.IsStatic
+                && method.Parameters.Length == 0
+                && method.ReturnsVoid
+                && method.DeclaredAccessibility == Accessibility.Public)
+                return true;
+        return false;
+    }
+
+    /// <summary>
+    /// True if <paramref name="expr"/> is a "trivial" initializer in the sense
+    /// of Unity's Auto-resolution table — one whose constructed state matches
+    /// what <c>Clear()</c> would restore (i.e. an empty container). Used to
+    /// gate the Clear strategy on readonly fields: <c>new()</c> and
+    /// <c>new T()</c> are trivial; <c>new T() { 1, 2, 3 }</c> isn't (Clear
+    /// would empty the collection and not restore the original elements).
+    /// </summary>
+    public static bool IsTrivialInitializer(ExpressionSyntax expr)
+    {
+        if (expr == null) return false;
+        return expr switch
+        {
+            ObjectCreationExpressionSyntax oc =>
+                (oc.ArgumentList == null || oc.ArgumentList.Arguments.Count == 0)
+                && oc.Initializer == null,
+            ImplicitObjectCreationExpressionSyntax ioc =>
+                ioc.ArgumentList.Arguments.Count == 0
+                && ioc.Initializer == null,
+            LiteralExpressionSyntax lit =>
+                lit.IsKind(SyntaxKind.NullLiteralExpression)
+                || lit.IsKind(SyntaxKind.DefaultLiteralExpression),
+            DefaultExpressionSyntax => true,
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// True if <paramref name="field"/> qualifies for the Clear cleanup
+    /// strategy: readonly, type has a usable <c>Clear()</c>, and the field's
+    /// initializer is trivial. When this is true, the generator emits
+    /// <c>_field.Clear();</c> instead of the readonly-skip behavior, and the
+    /// analyzer suppresses ASC002.
+    /// </summary>
+    public static bool CanCleanReadonlyField(IFieldSymbol field) =>
+        field.IsReadOnly
+        && HasClearMethod(field.Type)
+        && IsTrivialInitializer(GetFieldInitializerSyntax(field));
+
+    private static ExpressionSyntax GetFieldInitializerSyntax(IFieldSymbol field)
+    {
+        if (field.DeclaringSyntaxReferences.Length == 0) return null;
+        return field.DeclaringSyntaxReferences[0].GetSyntax() is VariableDeclaratorSyntax vds
+            ? vds.Initializer?.Value
+            : null;
+    }
+
     public static bool HasAttribute(ISymbol symbol, string fullName)
     {
         foreach (var attr in symbol.GetAttributes())
@@ -180,7 +246,12 @@ internal static class Validation
             return Diagnostic.Create(MemberMustBeStatic, FirstLocationOf(field), field.Name);
         if (field.IsConst)
             return Diagnostic.Create(ConstFieldNotSupported, FirstLocationOf(field), field.Name);
-        if (field.IsReadOnly)
+
+        // Readonly is supported when the type has Clear() AND the initializer
+        // is trivial — the generator emits `field.Clear();`. Otherwise ASC002
+        // fires (covers "no Clear()" and "non-trivial initializer", both of
+        // which mean we can't restore the original state).
+        if (field.IsReadOnly && !CanCleanReadonlyField(field))
             return Diagnostic.Create(ReadonlyNotSupported, FirstLocationOf(field), field.Name);
 
         var owner = field.ContainingType;
