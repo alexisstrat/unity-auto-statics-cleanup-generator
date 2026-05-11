@@ -314,7 +314,7 @@ public partial class Foo
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         var asc003 = diags.Single(d => d.Id == "ASC003");
-        Assert.Equal(DiagnosticSeverity.Warning, asc003.Severity);
+        Assert.Equal(DiagnosticSeverity.Error, asc003.Severity);
         Assert.DoesNotContain("Counter", output);
     }
 
@@ -405,7 +405,7 @@ public partial class Foo
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         var asc002 = diags.Single(d => d.Id == "ASC002");
-        Assert.Equal(DiagnosticSeverity.Warning, asc002.Severity);
+        Assert.Equal(DiagnosticSeverity.Error, asc002.Severity);
         Assert.DoesNotContain("Constant", output);
     }
 }
@@ -507,7 +507,7 @@ public partial class Foo
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         var asc006 = diags.Single(d => d.Id == "ASC006");
-        Assert.Equal(DiagnosticSeverity.Warning, asc006.Severity);
+        Assert.Equal(DiagnosticSeverity.Error, asc006.Severity);
         Assert.DoesNotContain("Counter", output);
     }
 
@@ -523,7 +523,7 @@ public partial class Foo
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         var asc006 = diags.Single(d => d.Id == "ASC006");
-        Assert.Equal(DiagnosticSeverity.Warning, asc006.Severity);
+        Assert.Equal(DiagnosticSeverity.Error, asc006.Severity);
         Assert.DoesNotContain("Counter", output);
     }
 
@@ -540,7 +540,7 @@ public partial class Bus
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         var asc006 = diags.Single(d => d.Id == "ASC006");
-        Assert.Equal(DiagnosticSeverity.Warning, asc006.Severity);
+        Assert.Equal(DiagnosticSeverity.Error, asc006.Severity);
         Assert.DoesNotContain("OnSomething", output);
     }
 
@@ -556,7 +556,7 @@ public partial class Foo
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         var asc007 = diags.Single(d => d.Id == "ASC007");
-        Assert.Equal(DiagnosticSeverity.Warning, asc007.Severity);
+        Assert.Equal(DiagnosticSeverity.Error, asc007.Severity);
         Assert.DoesNotContain("Magic", output);
     }
 
@@ -575,7 +575,7 @@ public partial class Bus
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         var asc004 = diags.Single(d => d.Id == "ASC004");
-        Assert.Equal(DiagnosticSeverity.Warning, asc004.Severity);
+        Assert.Equal(DiagnosticSeverity.Error, asc004.Severity);
         Assert.DoesNotContain("OnSomething", output);
     }
 
@@ -637,7 +637,7 @@ public partial class Foo
 }";
         var diags = AnalyzerTestHelper.Run(src);
         var asc008 = diags.Single(d => d.Id == "ASC008");
-        Assert.Equal(DiagnosticSeverity.Warning, asc008.Severity);
+        Assert.Equal(DiagnosticSeverity.Error, asc008.Severity);
     }
 
     [Fact]

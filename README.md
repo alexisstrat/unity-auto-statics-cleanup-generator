@@ -13,6 +13,7 @@ Static fields, properties, and events marked with the `[AutoStaticsCleanup]` att
   - [2. Drop the analyzer DLL into Unity](#2-drop-the-analyzer-dll-into-unity)
   - [3. Use it](#3-use-it)
 - [Diagnostics](#diagnostics)
+- [Migrating to Unity 6.5+](#migrating-to-unity-65)
 - [How it works](#how-it-works)
 
 ## What it does
@@ -204,19 +205,19 @@ public class EnemyManager  : Singleton<EnemyManager>  { }
 
 ## Diagnostics
 
-`AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator) reports the rules below. Warnings ASC002-007 fire only when the attribute is on the **member directly** — class-level `[AutoStaticsCleanup]` silently filters unfit members to match Unity 6.5's "reset everything resettable, leave the rest alone" semantic. ASC008 fires at the type level whenever the attributed type has an explicit static constructor.
+`AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator) reports the rules below. ASC002-007 fire only when the attribute is on the **member directly** — class-level `[AutoStaticsCleanup]` silently filters unfit members to match Unity 6.5's "reset everything resettable, leave the rest alone" semantic. ASC008 fires at the type level whenever the attributed type has an explicit static constructor.
 
-Only `ASC001` ships with a quick-fix; the warnings are diagnostic-only — change the code to fix them, or suppress per call site.
+All rules are Errors. Quick fixes are available for ASC001/002/003/006; ASC004/007/008 are diagnostic-only — the message tells you what to do, but the change requires a manual decision.
 
 | ID | Severity | When | Quick fix |
 |---|---|---|---|
 | `ASC001` | Error | The attributed type (or any enclosing type) is not declared `partial`, and the generator would otherwise emit code for at least one member. | Add `partial` modifier to the offending type. |
-| `ASC002` | Warning | Member-level `[AutoStaticsCleanup]` on a `readonly` field that can't be reset — either the type has no `Clear()` method or the initializer is non-trivial (e.g., `new() { 1, 2, 3 }`). Readonly + `Clear()` + trivial init (`new()`, `new T()`) is supported and emits a `Clear()` call instead. | — |
-| `ASC003` | Warning | Member-level on a property without a settable setter (get-only, init-only) — the generator can't reset it, so the attribute is ignored. | — |
-| `ASC004` | Warning | Member-level on a manual event (explicit `add`/`remove`) — the unsubscribe loop needs the compiler-generated backing field, so the attribute is ignored. | — |
-| `ASC006` | Warning | Member-level on an instance member — only static state is cleaned up; the attribute is ignored. | — |
-| `ASC007` | Warning | Member-level on a `const` field — constants can't be reset; the attribute has no effect. | — |
-| `ASC008` | Warning | The attributed type has an explicit `static T() { … }` constructor — its run-order relative to the generated cleanup-class initialization is unspecified, which can leave state re-initialized after cleanup. | — |
+| `ASC002` | Error | Member-level `[AutoStaticsCleanup]` on a `readonly` field that can't be reset — either the type has no `Clear()` method or the initializer is non-trivial (e.g., `new() { 1, 2, 3 }`). Readonly + `Clear()` + trivial init (`new()`, `new T()`) is supported and emits a `Clear()` call instead. | Remove the `readonly` modifier. |
+| `ASC003` | Error | Member-level on a property without a settable setter (get-only, init-only) — the generator can't reset it. | Add a `set;` accessor (auto-properties only — manual / expression-bodied / init-only properties need a manual fix). |
+| `ASC004` | Error | Member-level on a manual event (explicit `add`/`remove`) — the unsubscribe loop needs the compiler-generated backing field. | — |
+| `ASC006` | Error | Member-level on an instance member — only static state is cleaned up. | Add the `static` modifier. |
+| `ASC007` | Error | Member-level on a `const` field — constants can't be reset. | — |
+| `ASC008` | Error | The attributed type has an explicit `static T() { … }` constructor — its run-order relative to the generated cleanup-class initialization is unspecified, which can leave state re-initialized after cleanup. | — |
 
 ### IDisposable fields and properties
 
@@ -226,7 +227,13 @@ When an attributed field or property's type implements `System.IDisposable` (dir
 
 `static readonly` fields are normally unreachable for cleanup (the generator can't reassign them). When the field type exposes a public parameterless `Clear()` method **and** the initializer is trivial (`new()`, `new T()`, `null`, `default`), the generator emits `field.Clear();` instead — empties the container in place while keeping the reference stable. Covers `List<T>`, `Dictionary<K,V>`, `HashSet<T>`, `Queue<T>`, `Stack<T>`, `ConcurrentDictionary<K,V>`, and any user wrapper with a matching `Clear()`.
 
-Non-trivial initializers like `new() { 1, 2, 3 }` are intentionally rejected (ASC002) because `Clear()` would empty the collection rather than restore the original elements — Unity's source generator treats this the same way.
+Non-trivial initializers like `new() { 1, 2, 3 }` are intentionally rejected (ASC002) because `Clear()` would empty the collection rather than restore the original elements.
+
+## Migrating to Unity 6.5+
+
+1. Upgrade the Unity Editor to 6.5+.
+2. **Delete `AutoStaticsCleanup.dll` from the project.** Otherwise the backport's analyzer continues to run alongside Unity's built-in one, producing its own diagnostics. Removing the DLL also stops the redundant source-generator passes — the emitted code is already gated out at compile time, but the per-keystroke symbol walks aren't.
+3. Optionally delete the user-side scaffolding files (`AutoStaticsCleanupAttribute.cs`, `NoAutoStaticsCleanupAttribute.cs`, `PlayModeScopeAutoCleanup.cs`, `PlayModeScopeAutoCleanupRegistrar.cs`). They compile to nothing under `#if !UNITY_6000_5_OR_NEWER`, so leaving them in is harmless.
 
 ## How it works
 

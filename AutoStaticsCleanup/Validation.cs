@@ -39,41 +39,41 @@ internal static class Validation
     public static readonly DiagnosticDescriptor ReadonlyNotSupported = new(
         "ASC002",
         "[AutoStaticsCleanup] readonly field cannot be reset",
-        "Field '{0}' is readonly; reset requires either a settable field or a type with a public Clear() method AND a trivial initializer (e.g., 'new()'). The attribute will be ignored.",
+        "Field '{0}' is readonly. Remove the 'readonly' modifier, or use a type with a public parameterless Clear() method and a trivial initializer (e.g., 'new()').",
         "AutoStaticsCleanup",
-        DiagnosticSeverity.Warning,
+        DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
     public static readonly DiagnosticDescriptor PropertyNeedsSetter = new(
         "ASC003",
         "[AutoStaticsCleanup] requires a property setter",
-        "Property '{0}' has no usable setter; [AutoStaticsCleanup] requires a settable property (init-only setters are not callable from Cleanup), so the attribute will be ignored",
+        "Property '{0}' has no settable setter. Add a 'set;' accessor (init-only setters are not callable from Cleanup).",
         "AutoStaticsCleanup",
-        DiagnosticSeverity.Warning,
+        DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
     public static readonly DiagnosticDescriptor ManualEventNotSupported = new(
         "ASC004",
         "[AutoStaticsCleanup] does not support manual events",
-        "Event '{0}' has explicit 'add'/'remove' accessors; [AutoStaticsCleanup] only supports field-like events, so the attribute will be ignored",
+        "Event '{0}' has explicit 'add'/'remove' accessors. Convert it to a field-like event, or remove [AutoStaticsCleanup].",
         "AutoStaticsCleanup",
-        DiagnosticSeverity.Warning,
+        DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
     public static readonly DiagnosticDescriptor MemberMustBeStatic = new(
         "ASC006",
         "[AutoStaticsCleanup] requires a static member",
-        "Member '{0}' is not static; [AutoStaticsCleanup] only applies to static fields, properties, and events, so the attribute will be ignored",
+        "Member '{0}' is not static. Add the 'static' modifier, or remove [AutoStaticsCleanup].",
         "AutoStaticsCleanup",
-        DiagnosticSeverity.Warning,
+        DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
     public static readonly DiagnosticDescriptor ConstFieldNotSupported = new(
         "ASC007",
         "[AutoStaticsCleanup] cannot be applied to const fields",
-        "Field '{0}' is const; const fields cannot be reset and [AutoStaticsCleanup] has no effect",
+        "Field '{0}' is const and cannot be reset. Remove [AutoStaticsCleanup] from the const field.",
         "AutoStaticsCleanup",
-        DiagnosticSeverity.Warning,
+        DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
     public static readonly DiagnosticDescriptor StaticConstructorNotSupported = new(
@@ -81,7 +81,7 @@ internal static class Validation
         "[AutoStaticsCleanup] is incompatible with explicit static constructors",
         "Type '{0}' has an explicit static constructor; [AutoStaticsCleanup]'s nested cleanup-class initialization runs in unspecified order relative to it, which can leave the class re-initialized after cleanup. Remove the static constructor or [AutoStaticsCleanup].",
         "AutoStaticsCleanup",
-        DiagnosticSeverity.Warning,
+        DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
     // -----------------------------------------------------------------
