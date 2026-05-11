@@ -42,6 +42,7 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         public MemberKind Kind { get; init; }
         public string DelegateTypeFq { get; init; }
         public bool RequiresGuard { get; init; }
+        public bool RequiresDispose { get; init; }
         public string Initializer { get; init; }
         public int SourceOrder { get; init; }
         public ImmutableArray<string> FileUsings { get; init; }
@@ -63,6 +64,7 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             Kind == other.Kind &&
             DelegateTypeFq == other.DelegateTypeFq &&
             RequiresGuard == other.RequiresGuard &&
+            RequiresDispose == other.RequiresDispose &&
             Initializer == other.Initializer &&
             SourceOrder == other.SourceOrder &&
             ChainEquals(FileUsings, other.FileUsings) &&
@@ -389,6 +391,7 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             MemberName = field.Name,
             Kind = MemberKind.Assign,
             RequiresGuard = TypeRequiresGuard(field.Type),
+            RequiresDispose = initText != null && Validation.ImplementsIDisposable(field.Type),
             Initializer = initText,
             InitializerNamespaces = initNs,
             SourceOrder = SourceOrderOf(field),
@@ -428,6 +431,7 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             MemberName = prop.Name,
             Kind = MemberKind.Assign,
             RequiresGuard = TypeRequiresGuard(prop.Type),
+            RequiresDispose = initText != null && Validation.ImplementsIDisposable(prop.Type),
             Initializer = initText,
             InitializerNamespaces = initNs,
             SourceOrder = SourceOrderOf(prop),
@@ -816,7 +820,17 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     private static void EmitAssign(IndentedTextWriter w, ResetEntry e)
     {
         var rhs = e.Initializer ?? "default";
-        if (e.RequiresGuard)
+        if (e.RequiresDispose)
+        {
+            // Dispose the existing value before reassigning. The null guard is
+            // merged into the same branch when the field is a reference type so
+            // a never-touched field is a single check, not two.
+            if (e.RequiresGuard)
+                w.WriteLine($"if({e.MemberName} is not null) {{ {e.MemberName}.Dispose(); {e.MemberName} = {rhs}; }}");
+            else
+                w.WriteLine($"{e.MemberName}.Dispose(); {e.MemberName} = {rhs};");
+        }
+        else if (e.RequiresGuard)
             w.WriteLine($"if({e.MemberName} is not null) {e.MemberName} = {rhs};");
         else
             w.WriteLine($"{e.MemberName} = {rhs};");

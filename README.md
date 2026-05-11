@@ -204,7 +204,7 @@ public class EnemyManager  : Singleton<EnemyManager>  { }
 
 ## Diagnostics
 
-`AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator) reports the rules below. Warnings fire only when the attribute is on the **member directly** — class-level `[AutoStaticsCleanup]` silently filters unfit members to match Unity 6.5's "reset everything resettable, leave the rest alone" semantic.
+`AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator) reports the rules below. Warnings ASC002-007 fire only when the attribute is on the **member directly** — class-level `[AutoStaticsCleanup]` silently filters unfit members to match Unity 6.5's "reset everything resettable, leave the rest alone" semantic. ASC008 fires at the type level whenever the attributed type has an explicit static constructor.
 
 Only `ASC001` ships with a quick-fix; the warnings are diagnostic-only — change the code to fix them, or suppress per call site.
 
@@ -216,6 +216,11 @@ Only `ASC001` ships with a quick-fix; the warnings are diagnostic-only — chang
 | `ASC004` | Warning | Member-level on a manual event (explicit `add`/`remove`) — the unsubscribe loop needs the compiler-generated backing field, so the attribute is ignored. | — |
 | `ASC006` | Warning | Member-level on an instance member — only static state is cleaned up; the attribute is ignored. | — |
 | `ASC007` | Warning | Member-level on a `const` field — constants can't be reset; the attribute has no effect. | — |
+| `ASC008` | Warning | The attributed type has an explicit `static T() { … }` constructor — its run-order relative to the generated cleanup-class initialization is unspecified, which can leave state re-initialized after cleanup. | — |
+
+### IDisposable fields and properties
+
+When an attributed field or property's type implements `System.IDisposable` (directly, transitively, or via a generic constraint) and there's an initializer to reassign to, the generator emits `field?.Dispose()` before the reassignment. This handles `Stream`, `HttpClient`, and any user `IDisposable` implementation without leaking the previous instance on play-mode transitions.
 
 ## How it works
 
