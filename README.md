@@ -7,7 +7,8 @@ Static fields, properties, and events marked with the `[AutoStaticsCleanup]` att
 ## Contents
 
 - [What it does](#what-it-does)
-- [Building](#building)
+- [Installation](#installation)
+- [Building from source](#building-from-source)
 - [Setup](#setup)
   - [1. Define the trigger attributes and runtime scaffolding](#1-define-the-trigger-attributes-and-runtime-scaffolding)
   - [2. Drop the analyzer DLL into Unity](#2-drop-the-analyzer-dll-into-unity)
@@ -25,9 +26,33 @@ For every static member you opt in, on every Editor play-mode transition:
 - **Generic types** like `class Singleton<T>` work out of the box: the cleanup class is emitted inside the open generic, and each closed instantiation registers itself when its static constructor first runs.
 - Visibility doesn't matter — `private` and `internal` members work because the cleanup class is nested inside the target type and has direct access.
 
-## Building
+## Installation
 
-> **No prebuilt DLL is published — you must build the analyzer yourself before [Setup](#setup).**
+You have two options. Pick whichever you trust more.
+
+### Option A — Download the precompiled DLL (convenience)
+
+Each [tagged release](https://github.com/alexisstrat/unity-auto-statics-cleanup-generator/releases) ships `AutoStaticsCleanup.dll` as an asset, alongside:
+
+- `AutoStaticsCleanup.dll.sha256` — checksum for manual verification.
+- A GitHub-issued [build-provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) proving the DLL was built by this repo's CI from the tagged commit.
+
+**Verify the attestation** before dropping the DLL into your project:
+
+```bash
+gh attestation verify AutoStaticsCleanup.dll \
+  --repo alexisstrat/unity-auto-statics-cleanup-generator
+```
+
+A passing verification means the DLL came from this repository's release workflow on the source commit at that tag — nothing else can produce a valid attestation under this repo's name.
+
+Once verified, continue to [Setup](#setup).
+
+### Option B — Build from source (recommended for full transparency)
+
+Building yourself is the strongest trust signal — you read the source, you produce the binary, no third party is in the chain. See [Building from source](#building-from-source) below.
+
+## Building from source
 
 The shippable artifact is `AutoStaticsCleanup/bin/Release/netstandard2.0/AutoStaticsCleanup.dll`. Roslyn analyzers must target **netstandard2.0**; the project is already set up that way.
 
