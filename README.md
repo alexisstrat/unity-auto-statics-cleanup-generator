@@ -13,6 +13,7 @@ Static fields, properties, and events marked with the `[AutoStaticsCleanup]` att
   - [2. Drop the analyzer DLL into Unity](#2-drop-the-analyzer-dll-into-unity)
   - [3. Use it](#3-use-it)
 - [Diagnostics](#diagnostics)
+- [Migrating to Unity 6.5+](#migrating-to-unity-65)
 - [How it works](#how-it-works)
 
 ## What it does
@@ -240,6 +241,12 @@ When an attributed field or property's type implements `System.IDisposable` (dir
 `static readonly` fields are normally unreachable for cleanup (the generator can't reassign them). When the field type exposes a public parameterless `Clear()` method **and** the initializer is trivial (`new()`, `new T()`, `null`, `default`), the generator emits `field.Clear();` instead — empties the container in place while keeping the reference stable. Covers `List<T>`, `Dictionary<K,V>`, `HashSet<T>`, `Queue<T>`, `Stack<T>`, `ConcurrentDictionary<K,V>`, and any user wrapper with a matching `Clear()`.
 
 Non-trivial initializers like `new() { 1, 2, 3 }` are intentionally rejected (ASC002) because `Clear()` would empty the collection rather than restore the original elements — Unity's source generator treats this the same way.
+
+## Migrating to Unity 6.5+
+
+1. Upgrade the Unity Editor to 6.5+.
+2. **Delete `AutoStaticsCleanup.dll` from the project.** Otherwise the backport's analyzer continues to run alongside Unity's built-in one, producing its own diagnostics. Removing the DLL also stops the redundant source-generator passes — the emitted code is already gated out at compile time, but the per-keystroke symbol walks aren't.
+3. Optionally delete the user-side scaffolding files (`AutoStaticsCleanupAttribute.cs`, `NoAutoStaticsCleanupAttribute.cs`, `PlayModeScopeAutoCleanup.cs`, `PlayModeScopeAutoCleanupRegistrar.cs`). They compile to nothing under `#if !UNITY_6000_5_OR_NEWER`, so leaving them in is harmless.
 
 ## How it works
 
