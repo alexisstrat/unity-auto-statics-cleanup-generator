@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Composition;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
@@ -15,7 +16,7 @@ namespace AutoStaticsCleanup;
 public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
 {
     public override ImmutableArray<string> FixableDiagnosticIds { get; } =
-        ImmutableArray.Create("ASC001");
+        ImmutableArray.Create("ASC001", "ASC002", "ASC003", "ASC006");
 
     public override FixAllProvider GetFixAllProvider() => WellKnownFixAllProviders.BatchFixer;
 
@@ -26,11 +27,28 @@ public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
 
         foreach (var diagnostic in context.Diagnostics)
         {
-            if (diagnostic.Id != "ASC001") continue;
             var node = root.FindNode(diagnostic.Location.SourceSpan, getInnermostNodeForTie: true);
-            RegisterAddPartial(context, root, node, diagnostic);
+            switch (diagnostic.Id)
+            {
+                case "ASC001":
+                    RegisterAddPartial(context, root, node, diagnostic);
+                    break;
+                case "ASC002":
+                    RegisterRemoveReadonly(context, root, node, diagnostic);
+                    break;
+                case "ASC003":
+                    RegisterAddSetter(context, root, node, diagnostic);
+                    break;
+                case "ASC006":
+                    RegisterMakeStatic(context, root, node, diagnostic);
+                    break;
+            }
         }
     }
+
+    // -----------------------------------------------------------------
+    //  ASC001 — add `partial`
+    // -----------------------------------------------------------------
 
     private static void RegisterAddPartial(
         CodeFixContext context, SyntaxNode root, SyntaxNode node, Diagnostic diagnostic)
@@ -52,7 +70,7 @@ public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
              current != null;
              current = current.Parent?.FirstAncestorOrSelf<TypeDeclarationSyntax>())
         {
-            if (!HasPartialModifier(current)) return current;
+            if (!HasModifier(current.Modifiers, SyntaxKind.PartialKeyword)) return current;
         }
         return null;
     }
@@ -65,16 +83,125 @@ public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
 
         // Place `partial` immediately before the `class`/`struct`/`record` keyword,
         // i.e. as the last modifier — this matches conventional C# ordering.
-        var newModifiers = typeDecl.Modifiers.Add(partialToken);
-        var newDecl = typeDecl.WithModifiers(newModifiers);
-
+        var newDecl = typeDecl.WithModifiers(typeDecl.Modifiers.Add(partialToken));
         return Task.FromResult(document.WithSyntaxRoot(root.ReplaceNode(typeDecl, newDecl)));
     }
 
-    private static bool HasPartialModifier(TypeDeclarationSyntax typeDecl)
+    // -----------------------------------------------------------------
+    //  ASC002 — remove `readonly`
+    // -----------------------------------------------------------------
+
+    private static void RegisterRemoveReadonly(
+        CodeFixContext context, SyntaxNode root, SyntaxNode node, Diagnostic diagnostic)
     {
-        foreach (var m in typeDecl.Modifiers)
-            if (m.IsKind(SyntaxKind.PartialKeyword))
+        var fieldDecl = node.FirstAncestorOrSelf<FieldDeclarationSyntax>();
+        if (fieldDecl == null) return;
+        if (!HasModifier(fieldDecl.Modifiers, SyntaxKind.ReadOnlyKeyword)) return;
+
+        context.RegisterCodeFix(
+            CodeAction.Create(
+                title: "Remove 'readonly' modifier",
+                createChangedDocument: ct => RemoveReadonlyAsync(context.Document, root, fieldDecl, ct),
+                equivalenceKey: "ASC002_RemoveReadonly"),
+            diagnostic);
+    }
+
+    private static Task<Document> RemoveReadonlyAsync(
+        Document document, SyntaxNode root, FieldDeclarationSyntax fieldDecl, CancellationToken ct)
+    {
+        var newModifiers = SyntaxFactory.TokenList(
+            fieldDecl.Modifiers.Where(m => !m.IsKind(SyntaxKind.ReadOnlyKeyword)));
+        var newDecl = fieldDecl.WithModifiers(newModifiers);
+        return Task.FromResult(document.WithSyntaxRoot(root.ReplaceNode(fieldDecl, newDecl)));
+    }
+
+    // -----------------------------------------------------------------
+    //  ASC003 — add `set;` accessor (auto-property only)
+    // -----------------------------------------------------------------
+
+    private static void RegisterAddSetter(
+        CodeFixContext context, SyntaxNode root, SyntaxNode node, Diagnostic diagnostic)
+    {
+        var propDecl = node.FirstAncestorOrSelf<PropertyDeclarationSyntax>();
+        if (propDecl == null) return;
+        if (propDecl.AccessorList == null) return; // expression-bodied — out of scope
+
+        // Auto-property check: every accessor body-less.
+        foreach (var accessor in propDecl.AccessorList.Accessors)
+            if (accessor.Body != null || accessor.ExpressionBody != null)
+                return;
+
+        var setter = propDecl.AccessorList.Accessors.FirstOrDefault(a => a.IsKind(SyntaxKind.SetAccessorDeclaration));
+        if (setter != null) return; // already has a non-init setter
+
+        var initSetter = propDecl.AccessorList.Accessors.FirstOrDefault(a => a.IsKind(SyntaxKind.InitAccessorDeclaration));
+        context.RegisterCodeFix(
+            CodeAction.Create(
+                title: initSetter != null ? "Replace 'init' with 'set' accessor" : "Add 'set;' accessor",
+                createChangedDocument: ct => AddSetterAsync(context.Document, root, propDecl, ct),
+                equivalenceKey: "ASC003_AddSetter"),
+            diagnostic);
+    }
+
+    private static Task<Document> AddSetterAsync(
+        Document document, SyntaxNode root, PropertyDeclarationSyntax propDecl, CancellationToken ct)
+    {
+        var newSetter = SyntaxFactory.AccessorDeclaration(SyntaxKind.SetAccessorDeclaration)
+            .WithSemicolonToken(SyntaxFactory.Token(SyntaxKind.SemicolonToken));
+
+        var accessors = propDecl.AccessorList!.Accessors
+            .Where(a => !a.IsKind(SyntaxKind.InitAccessorDeclaration))
+            .ToList();
+        accessors.Add(newSetter);
+
+        var newAccessorList = propDecl.AccessorList.WithAccessors(SyntaxFactory.List(accessors));
+        var newDecl = propDecl.WithAccessorList(newAccessorList);
+        return Task.FromResult(document.WithSyntaxRoot(root.ReplaceNode(propDecl, newDecl)));
+    }
+
+    // -----------------------------------------------------------------
+    //  ASC006 — add `static` modifier
+    // -----------------------------------------------------------------
+
+    private static void RegisterMakeStatic(
+        CodeFixContext context, SyntaxNode root, SyntaxNode node, Diagnostic diagnostic)
+    {
+        // The instance member can be a field, property, or event; each is its
+        // own declaration node kind, so handle them uniformly via MemberDeclarationSyntax.
+        var memberDecl = node.FirstAncestorOrSelf<MemberDeclarationSyntax>();
+        if (memberDecl == null) return;
+        if (memberDecl is not (FieldDeclarationSyntax or PropertyDeclarationSyntax or EventFieldDeclarationSyntax or EventDeclarationSyntax))
+            return;
+        if (HasModifier(memberDecl.Modifiers, SyntaxKind.StaticKeyword)) return;
+
+        context.RegisterCodeFix(
+            CodeAction.Create(
+                title: "Add 'static' modifier",
+                createChangedDocument: ct => MakeStaticAsync(context.Document, root, memberDecl, ct),
+                equivalenceKey: "ASC006_AddStatic"),
+            diagnostic);
+    }
+
+    private static Task<Document> MakeStaticAsync(
+        Document document, SyntaxNode root, MemberDeclarationSyntax memberDecl, CancellationToken ct)
+    {
+        var staticToken = SyntaxFactory.Token(SyntaxKind.StaticKeyword)
+            .WithTrailingTrivia(SyntaxFactory.Space);
+
+        // Add `static` at the end of the modifier list (after accessibility,
+        // before the type/return token) — matches conventional C# ordering.
+        var newDecl = memberDecl.WithModifiers(memberDecl.Modifiers.Add(staticToken));
+        return Task.FromResult(document.WithSyntaxRoot(root.ReplaceNode(memberDecl, newDecl)));
+    }
+
+    // -----------------------------------------------------------------
+    //  Shared
+    // -----------------------------------------------------------------
+
+    private static bool HasModifier(SyntaxTokenList modifiers, SyntaxKind kind)
+    {
+        foreach (var m in modifiers)
+            if (m.IsKind(kind))
                 return true;
         return false;
     }

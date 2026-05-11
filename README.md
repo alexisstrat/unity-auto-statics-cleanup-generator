@@ -204,19 +204,32 @@ public class EnemyManager  : Singleton<EnemyManager>  { }
 
 ## Diagnostics
 
-`AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator) reports the rules below. Warnings ASC002-007 fire only when the attribute is on the **member directly** — class-level `[AutoStaticsCleanup]` silently filters unfit members to match Unity 6.5's "reset everything resettable, leave the rest alone" semantic. ASC008 fires at the type level whenever the attributed type has an explicit static constructor.
+`AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator) reports the rules below. ASC002-007 fire only when the attribute is on the **member directly** — class-level `[AutoStaticsCleanup]` silently filters unfit members to match Unity 6.5's "reset everything resettable, leave the rest alone" semantic. ASC008 fires at the type level whenever the attributed type has an explicit static constructor.
 
-Only `ASC001` ships with a quick-fix; the warnings are diagnostic-only — change the code to fix them, or suppress per call site.
+All rules are Errors — they match Unity 6.5+'s diagnostic severities so user code that builds against this backport will also build under the engine's built-in source generator after a Unity Editor upgrade. Quick fixes (IDE lightbulbs) are available for ASC001/002/003/006; ASC004/007/008 are diagnostic-only — the message tells you what to do, but the change requires a manual decision.
 
 | ID | Severity | When | Quick fix |
 |---|---|---|---|
 | `ASC001` | Error | The attributed type (or any enclosing type) is not declared `partial`, and the generator would otherwise emit code for at least one member. | Add `partial` modifier to the offending type. |
-| `ASC002` | Warning | Member-level `[AutoStaticsCleanup]` on a `readonly` field that can't be reset — either the type has no `Clear()` method or the initializer is non-trivial (e.g., `new() { 1, 2, 3 }`). Readonly + `Clear()` + trivial init (`new()`, `new T()`) is supported and emits a `Clear()` call instead. | — |
-| `ASC003` | Warning | Member-level on a property without a settable setter (get-only, init-only) — the generator can't reset it, so the attribute is ignored. | — |
-| `ASC004` | Warning | Member-level on a manual event (explicit `add`/`remove`) — the unsubscribe loop needs the compiler-generated backing field, so the attribute is ignored. | — |
-| `ASC006` | Warning | Member-level on an instance member — only static state is cleaned up; the attribute is ignored. | — |
-| `ASC007` | Warning | Member-level on a `const` field — constants can't be reset; the attribute has no effect. | — |
-| `ASC008` | Warning | The attributed type has an explicit `static T() { … }` constructor — its run-order relative to the generated cleanup-class initialization is unspecified, which can leave state re-initialized after cleanup. | — |
+| `ASC002` | Error | Member-level `[AutoStaticsCleanup]` on a `readonly` field that can't be reset — either the type has no `Clear()` method or the initializer is non-trivial (e.g., `new() { 1, 2, 3 }`). Readonly + `Clear()` + trivial init (`new()`, `new T()`) is supported and emits a `Clear()` call instead. | Remove the `readonly` modifier. |
+| `ASC003` | Error | Member-level on a property without a settable setter (get-only, init-only) — the generator can't reset it. | Add a `set;` accessor (auto-properties only — manual / expression-bodied / init-only properties need a manual fix). |
+| `ASC004` | Error | Member-level on a manual event (explicit `add`/`remove`) — the unsubscribe loop needs the compiler-generated backing field. | — |
+| `ASC006` | Error | Member-level on an instance member — only static state is cleaned up. | Add the `static` modifier. |
+| `ASC007` | Error | Member-level on a `const` field — constants can't be reset. | — |
+| `ASC008` | Error | The attributed type has an explicit `static T() { … }` constructor — its run-order relative to the generated cleanup-class initialization is unspecified, which can leave state re-initialized after cleanup. | — |
+
+### Downgrading to warning per project
+
+If you want a softer landing during incremental adoption, drop these lines into `.editorconfig` at your project root to downgrade individual rules:
+
+```ini
+[*.cs]
+dotnet_diagnostic.ASC002.severity = warning
+dotnet_diagnostic.ASC003.severity = warning
+# … etc
+```
+
+Code that builds with warnings here will **break** after upgrading to Unity 6.5+, since the engine's analyzer treats these as errors. Use the downgrade only as a transient migration aid.
 
 ### IDisposable fields and properties
 
