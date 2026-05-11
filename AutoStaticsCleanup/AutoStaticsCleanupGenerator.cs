@@ -7,7 +7,6 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace AutoStaticsCleanup;
@@ -119,6 +118,36 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         public override int GetHashCode() => Entries.IsDefault ? 0 : Entries.Length;
     }
 
+    /// <summary>
+    /// One containing-type's deduped, ready-to-emit entries. Fanned out from the
+    /// collected transform results so <see cref="IIncrementalGenerator"/>'s
+    /// per-element caching can skip <see cref="GenerateSource"/> for groups
+    /// whose entries didn't change. Equality is structural on
+    /// <see cref="ContainingTypeKey"/> + <see cref="Entries"/>.
+    /// </summary>
+    private readonly struct TypeGroup : IEquatable<TypeGroup>
+    {
+        public string ContainingTypeKey { get; init; }
+        public ImmutableArray<ResetEntry> Entries { get; init; }
+
+        public bool Equals(TypeGroup other)
+        {
+            if (ContainingTypeKey != other.ContainingTypeKey) return false;
+            if (Entries.IsDefault) return other.Entries.IsDefault;
+            if (other.Entries.IsDefault || Entries.Length != other.Entries.Length) return false;
+            for (var i = 0; i < Entries.Length; i++)
+                if (!Entries[i].Equals(other.Entries[i]))
+                    return false;
+            return true;
+        }
+
+        public override bool Equals(object obj) => obj is TypeGroup other && Equals(other);
+
+        public override int GetHashCode() =>
+            unchecked((ContainingTypeKey?.GetHashCode() ?? 0) * 31
+                      + (Entries.IsDefault ? 0 : Entries.Length));
+    }
+
     // -----------------------------------------------------------------
     //  Pipeline
     // -----------------------------------------------------------------
@@ -130,11 +159,13 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             predicate: static (_, _) => true,
             transform: static (ctx, ct) => Extract(ctx, ct));
 
-        // Source — collect, group by containing type, emit one file per group.
-        // Roslyn's per-tree caching means an emitted file with byte-identical
-        // (name, text) skips downstream parsing on the next run, so editing one
-        // attributed type doesn't force the others to re-parse.
-        context.RegisterSourceOutput(results.Collect(), static (spc, all) =>
+        // Fan out: one TypeGroup per containing type. Roslyn compares fanned-out
+        // values positionally with structural equality, so editing one attributed
+        // file invalidates only that file's group — the other groups skip
+        // GenerateSource entirely. The sort below keeps positions stable across
+        // runs; without it, dictionary iteration order would shift and cascade-
+        // invalidate the downstream cache.
+        var grouped = results.Collect().SelectMany(static (all, ct) =>
         {
             var byType = new Dictionary<string, List<ResetEntry>>(StringComparer.Ordinal);
             foreach (var r in all)
@@ -151,13 +182,28 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
                 }
             }
 
-            foreach (var group in byType)
+            var groups = ImmutableArray.CreateBuilder<TypeGroup>(byType.Count);
+            foreach (var kvp in byType)
             {
-                var deduped = DeduplicateByMember(group.Value);
+                ct.ThrowIfCancellationRequested();
+                var deduped = DeduplicateByMember(kvp.Value);
                 if (deduped.Length == 0) continue;
-                var fileName = MakeFileName(deduped[0]);
-                spc.AddSource(fileName, GenerateSource(deduped));
+                groups.Add(new TypeGroup
+                {
+                    ContainingTypeKey = kvp.Key,
+                    Entries = deduped,
+                });
             }
+
+            // Ordinal sort is culture-free and gives a deterministic total order.
+            return groups.ToImmutable().Sort(static (a, b) =>
+                string.CompareOrdinal(a.ContainingTypeKey, b.ContainingTypeKey));
+        });
+
+        context.RegisterSourceOutput(grouped, static (spc, group) =>
+        {
+            var fileName = MakeFileName(group.Entries[0]);
+            spc.AddSource(fileName, GenerateSource(group.Entries));
         });
     }
 
@@ -587,23 +633,44 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     //  Source generation
     // -----------------------------------------------------------------
 
+    // Per-thread reusable buffer for GenerateSource. The default StringWriter
+    // ctor allocates a fresh StringBuilder that grows by doubling, producing
+    // several KB of intermediate garbage per generated file. Pooling the
+    // buffer lets cold runs reuse one allocation per thread.
+    [ThreadStatic] private static StringBuilder t_pooledBuilder;
+
+    // Cap pooled capacity so an outsize generated file (rare but possible
+    // with hundreds of attributed members) doesn't pin a huge buffer.
+    private const int MaxPooledBuilderCapacity = 32 * 1024;
+
     private static string GenerateSource(ImmutableArray<ResetEntry> entries)
     {
-        using var stringWriter = new StringWriter();
-        using var w = new IndentedTextWriter(stringWriter);
+        var sb = t_pooledBuilder;
+        if (sb == null) sb = new StringBuilder(2048);
+        else { t_pooledBuilder = null; sb.Clear(); }
 
-        // Caller has already grouped by containing type, deduped, and ordered.
-        EmitFileHeader(w, entries);
+        try
+        {
+            using var stringWriter = new StringWriter(sb);
+            using var w = new IndentedTextWriter(stringWriter);
 
-        var ordered = entries.OrderBy(e => e.Kind == MemberKind.Event ? 1 : 0)
-                             .ThenBy(e => e.SourceOrder)
-                             .ToList();
-        EmitTypeBlock(w, ordered[0], ordered);
+            // Caller has already grouped by containing type, deduped, and ordered.
+            EmitFileHeader(w, entries);
 
-        EmitFileFooter(w);
+            var ordered = entries.OrderBy(e => e.Kind == MemberKind.Event ? 1 : 0)
+                                 .ThenBy(e => e.SourceOrder)
+                                 .ToList();
+            EmitTypeBlock(w, ordered[0], ordered);
 
-        w.Flush();
-        return stringWriter.ToString();
+            EmitFileFooter(w);
+
+            w.Flush();
+            return sb.ToString();
+        }
+        finally
+        {
+            if (sb.Capacity <= MaxPooledBuilderCapacity) t_pooledBuilder = sb;
+        }
     }
 
     private static void EmitFileHeader(IndentedTextWriter w, ImmutableArray<ResetEntry> entries)

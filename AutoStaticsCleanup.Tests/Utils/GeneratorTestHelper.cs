@@ -2,7 +2,6 @@ using System;
 using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
-using AutoStaticsCleanup;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 
