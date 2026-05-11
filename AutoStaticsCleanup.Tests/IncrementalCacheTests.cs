@@ -43,7 +43,6 @@ public partial class Foo { [AutoStaticsCleanup] public static int A; }",
 
         driver = driver.RunGenerators(compilation);
 
-        // Edit only the bystander tree.
         var newBystander = CSharpSyntaxTree.ParseText("// bystander\n// edit", path: "bystander.cs");
         compilation = compilation.ReplaceSyntaxTree(bystander, newBystander);
         driver = driver.RunGenerators(compilation);
@@ -87,7 +86,6 @@ public partial class Bar { [AutoStaticsCleanup] public static int B; }",
 
         driver = driver.RunGenerators(compilation);
 
-        // Touch only Foo's tree (rename the field).
         var newFoo = CSharpSyntaxTree.ParseText(@"
 using Unity.Scripting.LifecycleManagement;
 public partial class Foo { [AutoStaticsCleanup] public static int Renamed; }",
@@ -98,7 +96,6 @@ public partial class Foo { [AutoStaticsCleanup] public static int Renamed; }",
         var run = driver.GetRunResult().Results.Single();
         var transformRuns = run.TrackedSteps["result_ForAttributeWithMetadataName"];
 
-        // Two declarations, two transform runs: one Modified (Foo's field), one Unchanged or Cached (Bar's).
         var reasons = transformRuns
             .SelectMany(s => s.Outputs.Select(o => o.Reason))
             .ToList();

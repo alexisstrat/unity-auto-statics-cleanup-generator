@@ -204,11 +204,18 @@ public class EnemyManager  : Singleton<EnemyManager>  { }
 
 ## Diagnostics
 
-`AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator) reports a single rule, `ASC001`. Every other misuse — instance member, const field, readonly field, manual event, expression-bodied property, get-only property, type nested in a generic — is silently skipped to match Unity 6.5's source generator. The C# compiler itself signals the partial-required case via "duplicate definition" once the generated partial collides with the user's non-partial declaration; `ASC001` surfaces that pre-codegen with a clearer message and a one-click fix.
+`AutoStaticsCleanupAnalyzer` (a `[DiagnosticAnalyzer]` shipped in the same DLL as the generator) reports the rules below. Warnings fire only when the attribute is on the **member directly** — class-level `[AutoStaticsCleanup]` silently filters unfit members to match Unity 6.5's "reset everything resettable, leave the rest alone" semantic.
+
+Only `ASC001` ships with a quick-fix; the warnings are diagnostic-only — change the code to fix them, or suppress per call site.
 
 | ID | Severity | When | Quick fix |
 |---|---|---|---|
 | `ASC001` | Error | The attributed type (or any enclosing type) is not declared `partial`, and the generator would otherwise emit code for at least one member. | Add `partial` modifier to the offending type. |
+| `ASC002` | Warning | Member-level `[AutoStaticsCleanup]` on a `readonly` field — `readonly` blocks the reassignment the generator would emit, so the attribute is ignored. | — |
+| `ASC003` | Warning | Member-level on a property without a settable setter (get-only, init-only) — the generator can't reset it, so the attribute is ignored. | — |
+| `ASC004` | Warning | Member-level on a manual event (explicit `add`/`remove`) — the unsubscribe loop needs the compiler-generated backing field, so the attribute is ignored. | — |
+| `ASC006` | Warning | Member-level on an instance member — only static state is cleaned up; the attribute is ignored. | — |
+| `ASC007` | Warning | Member-level on a `const` field — constants can't be reset; the attribute has no effect. | — |
 
 ## How it works
 

@@ -11,18 +11,22 @@ namespace AutoStaticsCleanup;
 /// <see cref="AutoStaticsCleanupGenerator"/> (which uses the shape predicates
 /// to decide whether to emit code for a member).
 ///
-/// Only ASC001 (must be 'partial') is surfaced as a diagnostic. Every other
-/// misuse (instance member, const field, readonly field, manual event,
-/// expression-bodied property, get-only property, type nested in generic) is
-/// silently skipped to match Unity 6.5's source generator. The compiler
-/// itself signals the partial-required case via "duplicate definition" once
-/// the generated partial collides with the user's non-partial declaration —
-/// ASC001 surfaces that pre-codegen with a clearer message and a one-click fix.
+/// Diagnostics fire only when the attribute is on a <i>member</i> directly.
+/// Type-level <c>[AutoStaticsCleanup]</c> silently skips unfit members
+/// (const, readonly, instance, manual events, etc.) the same way Unity 6.5
+/// does — putting the attribute on the class is "reset everything resettable,
+/// leave the rest alone." Member-level attribution is an explicit signal that
+/// something is intended; if the shape blocks it, that's a footgun worth a
+/// warning. ASC001 is the only Error; ASC002-007 are Warnings.
 /// </summary>
 internal static class Validation
 {
     public const string AttributeFullName = "Unity.Scripting.LifecycleManagement.AutoStaticsCleanupAttribute";
     public const string NoAttributeFullName = "Unity.Scripting.LifecycleManagement.NoAutoStaticsCleanupAttribute";
+
+    // -----------------------------------------------------------------
+    //  Descriptors
+    // -----------------------------------------------------------------
 
     public static readonly DiagnosticDescriptor MustBePartial = new(
         "ASC001",
@@ -30,6 +34,46 @@ internal static class Validation
         "Type '{0}' must be declared 'partial' (and so must every enclosing type) to use [AutoStaticsCleanup]",
         "AutoStaticsCleanup",
         DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ReadonlyNotSupported = new(
+        "ASC002",
+        "[AutoStaticsCleanup] cannot be applied to readonly fields",
+        "Field '{0}' is readonly; [AutoStaticsCleanup] requires a settable field, so the attribute will be ignored",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor PropertyNeedsSetter = new(
+        "ASC003",
+        "[AutoStaticsCleanup] requires a property setter",
+        "Property '{0}' has no usable setter; [AutoStaticsCleanup] requires a settable property (init-only setters are not callable from Cleanup), so the attribute will be ignored",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ManualEventNotSupported = new(
+        "ASC004",
+        "[AutoStaticsCleanup] does not support manual events",
+        "Event '{0}' has explicit 'add'/'remove' accessors; [AutoStaticsCleanup] only supports field-like events, so the attribute will be ignored",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor MemberMustBeStatic = new(
+        "ASC006",
+        "[AutoStaticsCleanup] requires a static member",
+        "Member '{0}' is not static; [AutoStaticsCleanup] only applies to static fields, properties, and events, so the attribute will be ignored",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
+
+    public static readonly DiagnosticDescriptor ConstFieldNotSupported = new(
+        "ASC007",
+        "[AutoStaticsCleanup] cannot be applied to const fields",
+        "Field '{0}' is const; const fields cannot be reset and [AutoStaticsCleanup] has no effect",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Warning,
         isEnabledByDefault: true);
 
     // -----------------------------------------------------------------
@@ -74,25 +118,23 @@ internal static class Validation
     }
 
     // -----------------------------------------------------------------
-    //  Validation (analyzer-only)
+    //  Validation (analyzer-only, member-level dispatch)
     // -----------------------------------------------------------------
     //
-    // The Validate* methods return ASC001 only when the generator would
-    // actually emit code for this member — i.e. when every silent-skip
-    // condition (non-static, const, readonly, manual event, etc.) passes.
-    // A static readonly field in a non-partial class produces no
-    // diagnostic because the generator silently skips readonly anyway,
-    // so there's no "duplicate definition" risk to warn about.
+    // Shape warnings (ASC002-007) fire BEFORE the partial-chain check
+    // because a shape warning already signals "this member won't be
+    // emitted." With no codegen there's no duplicate-definition risk,
+    // so ASC001 would be redundant noise on top.
 
     public static Diagnostic ValidateField(IFieldSymbol field)
     {
-        // Silent skips (Unity-parity): no diagnostic.
-        if (!field.IsStatic) return null;
-        if (field.IsConst) return null;
-        if (field.IsReadOnly) return null;
+        if (!field.IsStatic)
+            return Diagnostic.Create(MemberMustBeStatic, FirstLocationOf(field), field.Name);
+        if (field.IsConst)
+            return Diagnostic.Create(ConstFieldNotSupported, FirstLocationOf(field), field.Name);
+        if (field.IsReadOnly)
+            return Diagnostic.Create(ReadonlyNotSupported, FirstLocationOf(field), field.Name);
 
-        // Field would be emitted; flag the partial-chain problem before the
-        // C# compiler trips over a duplicate-definition error.
         var owner = field.ContainingType;
         if (!IsPartialChain(owner)) return CreatePartialDiagnostic(owner, field);
 
@@ -101,15 +143,17 @@ internal static class Validation
 
     public static Diagnostic ValidateProperty(IPropertySymbol prop)
     {
-        if (!prop.IsStatic) return null;
+        if (!prop.IsStatic)
+            return Diagnostic.Create(MemberMustBeStatic, FirstLocationOf(prop), prop.Name);
 
-        // Expression-bodied — silently skipped (carries no state).
+        // Expression-bodied — silently skipped (carries no state, warning would
+        // be confusing).
         if (prop.DeclaringSyntaxReferences.Length > 0
             && prop.DeclaringSyntaxReferences[0].GetSyntax() is PropertyDeclarationSyntax { ExpressionBody: not null })
             return null;
 
-        // No setter or init-only setter — silently skipped (Unity-parity).
-        if (prop.SetMethod == null || prop.SetMethod.IsInitOnly) return null;
+        if (prop.SetMethod == null || prop.SetMethod.IsInitOnly)
+            return Diagnostic.Create(PropertyNeedsSetter, FirstLocationOf(prop), prop.Name);
 
         var owner = prop.ContainingType;
         if (!IsPartialChain(owner)) return CreatePartialDiagnostic(owner, prop);
@@ -119,8 +163,10 @@ internal static class Validation
 
     public static Diagnostic ValidateEvent(IEventSymbol evt)
     {
-        if (!evt.IsStatic) return null;
-        if (!IsFieldLikeEvent(evt)) return null;
+        if (!evt.IsStatic)
+            return Diagnostic.Create(MemberMustBeStatic, FirstLocationOf(evt), evt.Name);
+        if (!IsFieldLikeEvent(evt))
+            return Diagnostic.Create(ManualEventNotSupported, FirstLocationOf(evt), evt.Name);
 
         var owner = evt.ContainingType;
         if (!IsPartialChain(owner)) return CreatePartialDiagnostic(owner, evt);
