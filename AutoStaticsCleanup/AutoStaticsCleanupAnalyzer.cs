@@ -27,7 +27,8 @@ public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
             Validation.PropertyNeedsSetter,
             Validation.ManualEventNotSupported,
             Validation.MemberMustBeStatic,
-            Validation.ConstFieldNotSupported);
+            Validation.ConstFieldNotSupported,
+            Validation.StaticConstructorNotSupported);
 
     public override void Initialize(AnalysisContext context)
     {
@@ -90,7 +91,12 @@ public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
     private static void AnalyzeType(SymbolAnalysisContext context, INamedTypeSymbol type)
     {
         if (!Validation.IsPartialChain(type))
+        {
             context.ReportDiagnostic(Validation.CreatePartialDiagnostic(type, type));
+            return;
+        }
+        if (Validation.HasExplicitStaticConstructor(type))
+            context.ReportDiagnostic(Validation.CreateStaticCtorDiagnostic(type, type));
     }
 
     private static void Report(SymbolAnalysisContext context, Diagnostic diagnostic)

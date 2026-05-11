@@ -76,6 +76,14 @@ internal static class Validation
         DiagnosticSeverity.Warning,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor StaticConstructorNotSupported = new(
+        "ASC008",
+        "[AutoStaticsCleanup] is incompatible with explicit static constructors",
+        "Type '{0}' has an explicit static constructor; [AutoStaticsCleanup]'s nested cleanup-class initialization runs in unspecified order relative to it, which can leave the class re-initialized after cleanup. Remove the static constructor or [AutoStaticsCleanup].",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Warning,
+        isEnabledByDefault: true);
+
     // -----------------------------------------------------------------
     //  Shape predicates (used by both analyzer and generator)
     // -----------------------------------------------------------------
@@ -100,6 +108,46 @@ internal static class Validation
 
     public static bool IsFieldLikeEvent(IEventSymbol evt) =>
         evt.AddMethod?.IsImplicitlyDeclared ?? true;
+
+    /// <summary>
+    /// True if <paramref name="type"/> is <c>System.IDisposable</c>, implements
+    /// it (transitively), or is a generic type parameter constrained to it.
+    /// Used to decide whether the generator should emit <c>field?.Dispose()</c>
+    /// before reassigning the captured initializer.
+    /// </summary>
+    public static bool ImplementsIDisposable(ITypeSymbol type)
+    {
+        if (type == null) return false;
+        if (IsSystemIDisposable(type)) return true;
+        foreach (var iface in type.AllInterfaces)
+            if (IsSystemIDisposable(iface))
+                return true;
+        if (type is ITypeParameterSymbol tp)
+            foreach (var constraint in tp.ConstraintTypes)
+                if (ImplementsIDisposable(constraint))
+                    return true;
+        return false;
+    }
+
+    private static bool IsSystemIDisposable(ITypeSymbol type) =>
+        type.Name == "IDisposable"
+        && type.ContainingNamespace is { Name: "System" } ns
+        && ns.ContainingNamespace is { IsGlobalNamespace: true };
+
+    /// <summary>
+    /// True if <paramref name="type"/> declares an explicit (non-compiler-
+    /// synthesized) static constructor. The compiler emits an implicit static
+    /// ctor for any class with static field initializers — we have to filter
+    /// those out via <c>IsImplicitlyDeclared</c>, otherwise every attributed
+    /// class would trip ASC008.
+    /// </summary>
+    public static bool HasExplicitStaticConstructor(INamedTypeSymbol type)
+    {
+        foreach (var ctor in type.StaticConstructors)
+            if (!ctor.IsImplicitlyDeclared)
+                return true;
+        return false;
+    }
 
     public static bool HasAttribute(ISymbol symbol, string fullName)
     {
@@ -137,6 +185,7 @@ internal static class Validation
 
         var owner = field.ContainingType;
         if (!IsPartialChain(owner)) return CreatePartialDiagnostic(owner, field);
+        if (HasExplicitStaticConstructor(owner)) return CreateStaticCtorDiagnostic(owner, field);
 
         return null;
     }
@@ -157,6 +206,7 @@ internal static class Validation
 
         var owner = prop.ContainingType;
         if (!IsPartialChain(owner)) return CreatePartialDiagnostic(owner, prop);
+        if (HasExplicitStaticConstructor(owner)) return CreateStaticCtorDiagnostic(owner, prop);
 
         return null;
     }
@@ -170,6 +220,7 @@ internal static class Validation
 
         var owner = evt.ContainingType;
         if (!IsPartialChain(owner)) return CreatePartialDiagnostic(owner, evt);
+        if (HasExplicitStaticConstructor(owner)) return CreateStaticCtorDiagnostic(owner, evt);
 
         return null;
     }
@@ -184,6 +235,9 @@ internal static class Validation
 
         return Diagnostic.Create(MustBePartial, AnchorLocation(offender, attributedSymbol), offender.ToDisplayString());
     }
+
+    public static Diagnostic CreateStaticCtorDiagnostic(INamedTypeSymbol type, ISymbol attributedSymbol) =>
+        Diagnostic.Create(StaticConstructorNotSupported, AnchorLocation(type, attributedSymbol), type.Name);
 
     private static Location AnchorLocation(INamedTypeSymbol typeForFallback, ISymbol attributedSymbol)
     {

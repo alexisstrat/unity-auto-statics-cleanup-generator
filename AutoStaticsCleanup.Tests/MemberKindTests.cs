@@ -94,6 +94,82 @@ public partial class Foo
         Assert.DoesNotContain("BindingFlags", output);
     }
 
+    [Fact]
+    public void IDisposableFieldEmitsDisposeBeforeReassignment()
+    {
+        const string src = @"
+using System;
+using Unity.Scripting.LifecycleManagement;
+public class MyDisposable : IDisposable { public void Dispose() {} }
+public partial class Foo
+{
+    [AutoStaticsCleanup] private static MyDisposable _d = new MyDisposable();
+}";
+        var output = Run(src);
+        Assert.Contains("if(_d is not null) { _d.Dispose(); _d = new MyDisposable(); }", output);
+    }
+
+    [Fact]
+    public void TransitivelyIDisposableFieldEmitsDispose()
+    {
+        // System.IO.MemoryStream implements IDisposable via System.IO.Stream.
+        const string src = @"
+using System.IO;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] private static MemoryStream _m = new MemoryStream();
+}";
+        var output = Run(src);
+        Assert.Contains("_m.Dispose();", output);
+    }
+
+    [Fact]
+    public void IDisposableFieldWithoutInitializerDoesNotEmitDispose()
+    {
+        // No init expression to reassign to — Dispose without reassign would
+        // leave the field pointing at a disposed instance. Skip Dispose; the
+        // null-guarded `_d = default` is the safest fallback.
+        const string src = @"
+using System;
+using Unity.Scripting.LifecycleManagement;
+public class MyDisposable : IDisposable { public void Dispose() {} }
+public partial class Foo
+{
+    [AutoStaticsCleanup] private static MyDisposable _d;
+}";
+        var output = Run(src);
+        Assert.DoesNotContain("Dispose", output);
+        Assert.Contains("if(_d is not null) _d = default;", output);
+    }
+
+    [Fact]
+    public void NonDisposableReferenceFieldDoesNotEmitDispose()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] private static string _s = ""hello"";
+}";
+        var output = Run(src);
+        Assert.DoesNotContain("Dispose", output);
+        Assert.Contains("if(_s is not null) _s = \"hello\";", output);
+    }
+
+    [Fact]
+    public void GenericIDisposableConstrainedFieldEmitsDispose()
+    {
+        const string src = @"
+using System;
+using Unity.Scripting.LifecycleManagement;
+public partial class Bag<T> where T : IDisposable, new()
+{
+    [AutoStaticsCleanup] private static T _x = new T();
+}";
+        var output = Run(src);
+        Assert.Contains("_x.Dispose();", output);
+    }
 }
 
 public class PropertyTests
@@ -177,6 +253,21 @@ public partial class Foo
     // Note: `init` accessors only apply to instance properties; the C# compiler
     // doesn't allow `static int X { get; init; }`, so the init-only path in the
     // generator is defensive-only and not directly testable here.
+
+    [Fact]
+    public void IDisposablePropertyEmitsDisposeBeforeReassignment()
+    {
+        const string src = @"
+using System;
+using Unity.Scripting.LifecycleManagement;
+public class MyDisposable : IDisposable { public void Dispose() {} }
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static MyDisposable D { get; set; } = new MyDisposable();
+}";
+        var output = Run(src);
+        Assert.Contains("if(D is not null) { D.Dispose(); D = new MyDisposable(); }", output);
+    }
 }
 
 public class EventTests
@@ -460,6 +551,56 @@ public partial class Foo
         Assert.DoesNotContain("Instance", output);
         Assert.DoesNotContain("Constant", output);
         Assert.DoesNotContain("E ", output);
+    }
+}
+
+public class StaticConstructorTests
+{
+    [Fact]
+    public void TypeLevelAttributeWithExplicitStaticConstructorEmitsAsc008()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    static Foo() { Counter = 1; }
+    public static int Counter;
+}";
+        var diags = AnalyzerTestHelper.Run(src);
+        var asc008 = diags.Single(d => d.Id == "ASC008");
+        Assert.Equal(DiagnosticSeverity.Warning, asc008.Severity);
+    }
+
+    [Fact]
+    public void MemberLevelAttributeInClassWithExplicitStaticConstructorEmitsAsc008()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    static Foo() { Counter = 1; }
+    [AutoStaticsCleanup] public static int Counter;
+}";
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC008");
+    }
+
+    [Fact]
+    public void ImplicitStaticConstructorFromFieldInitializersDoesNotEmitAsc008()
+    {
+        // The compiler synthesizes a static ctor for any class with static
+        // field initializers; that's marked IsImplicitlyDeclared and must not
+        // trip ASC008 (otherwise every attributed class would warn).
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    public static int Counter = 42;
+}";
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.DoesNotContain(diags, d => d.Id == "ASC008");
     }
 }
 
