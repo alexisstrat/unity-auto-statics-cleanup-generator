@@ -117,10 +117,21 @@ namespace Unity.Scripting.LifecycleManagement
 `PlayModeScopeAutoCleanup.cs` — abstract base class. Generated cleanup classes derive from it.
 ```csharp
 #if !UNITY_6000_5_OR_NEWER
+using System.Collections.Generic;
+
 namespace UnityEngine
 {
     public abstract class PlayModeScopeAutoCleanup
     {
+        private static readonly Dictionary<System.Type, PlayModeScopeAutoCleanup> Instances = new();
+
+        protected PlayModeScopeAutoCleanup()
+        {
+            Instances[GetType()] = this;
+        }
+
+        public static IEnumerable<PlayModeScopeAutoCleanup> RegisteredInstances => Instances.Values;
+
         public abstract void Cleanup();
     }
 }
@@ -131,25 +142,28 @@ namespace UnityEngine
 ```csharp
 #if UNITY_EDITOR && !UNITY_6000_5_OR_NEWER
 using System;
-using System.Collections.Generic;
+using System.Linq;
 using UnityEditor;
 using UnityEngine;
 
 namespace MyCustomNameSpace
 {
     [InitializeOnLoad]
-    internal static class PlayModeScopeAutoCleanupRegistrar
+    internal static class AutoStaticsCleanupRegistrar
     {
-        private static readonly Dictionary<Type, PlayModeScopeAutoCleanup> SByType = new();
-        
-        static PlayModeScopeAutoCleanupRegistrar()
+        static AutoStaticsCleanupRegistrar()
         {
-            foreach (var t in TypeCache.GetTypesDerivedFrom<PlayModeScopeAutoCleanup>())
+            foreach (var type in TypeCache.GetTypesDerivedFrom<PlayModeScopeAutoCleanup>())
             {
-                if (t.IsAbstract || t.ContainsGenericParameters) continue;
-                var instance = (PlayModeScopeAutoCleanup) Activator.CreateInstance(t);
-                var instanceType = instance.GetType();
-                SByType[instanceType] = instance;
+                if (type.IsAbstract || type.ContainsGenericParameters) continue;
+                try
+                {
+                    Activator.CreateInstance(type);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError("Failed to create instance of type " + type.FullName + ": " + e.Message);
+                }
             }
 
             EditorApplication.playModeStateChanged -= OnChange;
@@ -159,9 +173,20 @@ namespace MyCustomNameSpace
         private static void OnChange(PlayModeStateChange change)
         {
             if (change != PlayModeStateChange.ExitingEditMode
-                && change != PlayModeStateChange.ExitingPlayMode) return;
-            foreach (var c in SByType.Values)
-                c.Cleanup();
+                && change != PlayModeStateChange.EnteredEditMode) return;
+
+            var snapshot = PlayModeScopeAutoCleanup.RegisteredInstances.ToArray();
+            foreach (var c in snapshot)
+            {
+                try
+                {
+                    c.Cleanup();
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError("Failed to cleanup " + c.GetType().FullName + ": " + e.Message);
+                }
+            }
         }
     }
 }
