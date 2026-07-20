@@ -86,6 +86,14 @@ internal static class Validation
         DiagnosticSeverity.Error,
         isEnabledByDefault: true);
 
+    public static readonly DiagnosticDescriptor ReadonlyNullAtCleanup = new(
+        "ASC010",
+        "[AutoStaticsCleanup] readonly member is null at cleanup time",
+        "Member '{0}' is readonly with no object-creation initializer, so it is null when cleanup runs and the generated Clear() call throws NullReferenceException on every play-mode transition — Unity 6000.5.4f1+ generates the same failing cleanup. Initialize it with 'new …', remove 'readonly', or exclude it with [NoAutoStaticsCleanup].",
+        "AutoStaticsCleanup",
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true);
+
     public static readonly DiagnosticDescriptor StaticConstructorNotSupported = new(
         "ASC008",
         "[AutoStaticsCleanup] is incompatible with explicit static constructors",
@@ -211,22 +219,47 @@ internal static class Validation
     /// <summary>
     /// True if a readonly member of <paramref name="type"/> with the given
     /// initializer qualifies for the Clear cleanup strategy: the type needs a
-    /// <c>Clear()</c>, and the initializer must be absent, <c>default</c>, or
-    /// any object-creation expression. Braced collection initializers
-    /// (<c>new() { 1, 2 }</c>) are allowed because the generator restores
-    /// their elements after <c>Clear()</c> (see PostClearStatements). A bare
-    /// <c>null</c> initializer does NOT qualify — it's rejected rather than
-    /// emitting a guaranteed NullReferenceException.
+    /// <c>Clear()</c>, and the member must hold a real instance when cleanup
+    /// runs — any object-creation expression, or an absent/<c>default</c>
+    /// initializer on a value type (a default struct instance is real state).
+    /// Braced collection initializers (<c>new() { 1, 2 }</c>) are allowed
+    /// because the generator restores their elements after <c>Clear()</c>
+    /// (see PostClearStatements). A reference type without an object-creation
+    /// initializer does NOT qualify — the member would be null forever and
+    /// <c>Clear()</c> a guaranteed NullReferenceException (see
+    /// <see cref="ReadonlyIsNullAtCleanup"/>).
     /// </summary>
     public static bool CanCleanReadonly(ITypeSymbol type, ExpressionSyntax initializer)
     {
         if (!HasClearMethod(type)) return false;
         return initializer switch
         {
+            BaseObjectCreationExpressionSyntax => true,
+            null => type.IsValueType,
+            DefaultExpressionSyntax => type.IsValueType,
+            LiteralExpressionSyntax lit when lit.IsKind(SyntaxKind.DefaultLiteralExpression) => type.IsValueType,
+            _ => false,
+        };
+    }
+
+    /// <summary>
+    /// True if a readonly member of <paramref name="type"/> would be null
+    /// when cleanup runs: the type has a usable <c>Clear()</c>, but the
+    /// member is a reference type whose initializer is absent, <c>null</c>,
+    /// or <c>default</c> — and a readonly static can never be assigned later
+    /// (ASC008 already bans static constructors). The Clear strategy would
+    /// throw NullReferenceException on every play-mode transition, so these
+    /// shapes report ASC010 instead of emitting.
+    /// </summary>
+    public static bool ReadonlyIsNullAtCleanup(ITypeSymbol type, ExpressionSyntax initializer)
+    {
+        if (!type.IsReferenceType || !HasClearMethod(type)) return false;
+        return initializer switch
+        {
             null => true,
             DefaultExpressionSyntax => true,
-            LiteralExpressionSyntax lit when lit.IsKind(SyntaxKind.DefaultLiteralExpression) => true,
-            BaseObjectCreationExpressionSyntax => true,
+            LiteralExpressionSyntax lit when lit.IsKind(SyntaxKind.DefaultLiteralExpression)
+                || lit.IsKind(SyntaxKind.NullLiteralExpression) => true,
             _ => false,
         };
     }
@@ -305,6 +338,13 @@ internal static class Validation
             // ⇒ skip the chain checks too.
             if (ReadonlyTypeIsExempt(field.Type)) return null;
 
+            // Clear()-able type but no instance to call Clear() on — the
+            // member is null forever, so the cleanup is a guaranteed
+            // NullReferenceException (ASC010, distinct from ASC002 because
+            // the fix is different: add an initializer, not change the type).
+            if (ReadonlyIsNullAtCleanup(field.Type, GetFieldInitializerSyntax(field)))
+                return Diagnostic.Create(ReadonlyNullAtCleanup, FirstLocationOf(field), field.Name);
+
             // Otherwise readonly is supported only via the Clear strategy:
             // the type has Clear() and the initializer is a 'new …' expression
             // (braced elements are restored after Clear()) or default/absent.
@@ -345,10 +385,14 @@ internal static class Validation
         if (prop.SetMethod == null)
         {
             // Getter-only auto-properties follow the readonly-field rules:
-            // exempt types are silently skipped, Clear-strategy shapes are
-            // supported, everything else gets ASC003.
+            // exempt types are silently skipped, null-at-cleanup shapes get
+            // ASC010, Clear-strategy shapes are supported, everything else
+            // gets ASC003.
             if (ReadonlyTypeIsExempt(prop.Type)) return null;
-            if (!CanCleanReadonly(prop.Type, GetPropertyInitializerSyntax(prop)))
+            var init = GetPropertyInitializerSyntax(prop);
+            if (ReadonlyIsNullAtCleanup(prop.Type, init))
+                return Diagnostic.Create(ReadonlyNullAtCleanup, FirstLocationOf(prop), prop.Name);
+            if (!CanCleanReadonly(prop.Type, init))
                 return Diagnostic.Create(PropertyNeedsSetter, FirstLocationOf(prop), prop.Name);
         }
         else if (prop.SetMethod.IsInitOnly)
@@ -386,9 +430,10 @@ internal static class Validation
     /// <summary>
     /// Class-level scan companion: reports the member shapes that cannot be
     /// cleaned at all — readonly non-exempt members that don't qualify for
-    /// Clear, and disposable members with no initializer — even when only the
-    /// containing type carries [AutoStaticsCleanup]. These must fail the
-    /// build rather than be skipped silently. Merely-filtered shapes
+    /// Clear (ASC002/003), readonly members that are null at cleanup time
+    /// (ASC010), and disposable members with no initializer (ASC009) — even
+    /// when only the containing type carries [AutoStaticsCleanup]. These must
+    /// fail the build rather than be skipped silently. Merely-filtered shapes
     /// (instance, const, manual events, non-auto properties, exempt readonly)
     /// stay silent. Members carrying their own [AutoStaticsCleanup] are
     /// skipped here — the member-level Validate* path already reports them —
@@ -410,7 +455,10 @@ internal static class Validation
                 case IFieldSymbol { IsStatic: true, IsConst: false, IsImplicitlyDeclared: false } f:
                     if (f.IsReadOnly)
                     {
-                        if (!ReadonlyTypeIsExempt(f.Type) && !CanCleanReadonlyField(f))
+                        if (ReadonlyTypeIsExempt(f.Type)) break;
+                        if (ReadonlyIsNullAtCleanup(f.Type, GetFieldInitializerSyntax(f)))
+                            report(Diagnostic.Create(ReadonlyNullAtCleanup, FirstLocationOf(f), f.Name));
+                        else if (!CanCleanReadonlyField(f))
                             report(Diagnostic.Create(ReadonlyNotSupported, FirstLocationOf(f), f.Name));
                     }
                     else if (GetFieldInitializerSyntax(f) == null && HasDisposeMethod(f.Type))
@@ -423,8 +471,11 @@ internal static class Validation
                     when IsAutoProperty(p):
                     if (p.SetMethod == null)
                     {
-                        if (!ReadonlyTypeIsExempt(p.Type)
-                            && !CanCleanReadonly(p.Type, GetPropertyInitializerSyntax(p)))
+                        if (ReadonlyTypeIsExempt(p.Type)) break;
+                        var init = GetPropertyInitializerSyntax(p);
+                        if (ReadonlyIsNullAtCleanup(p.Type, init))
+                            report(Diagnostic.Create(ReadonlyNullAtCleanup, FirstLocationOf(p), p.Name));
+                        else if (!CanCleanReadonly(p.Type, init))
                             report(Diagnostic.Create(PropertyNeedsSetter, FirstLocationOf(p), p.Name));
                     }
                     else if (!p.SetMethod.IsInitOnly

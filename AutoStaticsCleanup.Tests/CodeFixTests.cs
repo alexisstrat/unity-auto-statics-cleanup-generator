@@ -107,4 +107,62 @@ public partial class Bus
         var fixed_ = CodeFixTestHelper.ApplyFirstFix(src, "ASC006");
         Assert.Contains("public static event Action OnSomething;", fixed_);
     }
+
+    [Fact]
+    public void Asc010AddsNewInitializerToReadonlyFieldWithoutOne()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly List<int> MyList;
+}";
+        var fixed_ = CodeFixTestHelper.ApplyFirstFix(src, "ASC010");
+        Assert.Contains("public static readonly List<int> MyList = new();", fixed_);
+    }
+
+    [Fact]
+    public void Asc010ReplacesNullInitializerWithNew()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly List<int> MyList = null;
+}";
+        var fixed_ = CodeFixTestHelper.ApplyFirstFix(src, "ASC010");
+        Assert.Contains("public static readonly List<int> MyList = new();", fixed_);
+    }
+
+    [Fact]
+    public void Asc010AddsInitializerToGetOnlyAutoProperty()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static List<int> Items { get; }
+}";
+        var fixed_ = CodeFixTestHelper.ApplyFirstFix(src, "ASC010");
+        Assert.Contains("public static List<int> Items { get; } = new();", fixed_);
+    }
+
+    [Fact]
+    public void Asc010OffersNoFixForAbstractType()
+    {
+        // `= new()` wouldn't compile for an abstract type, so the provider
+        // must stay quiet and leave the user to pick a concrete instance.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public abstract class Pool { public void Clear() { } }
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly Pool P;
+}";
+        Assert.Throws<System.InvalidOperationException>(
+            () => CodeFixTestHelper.ApplyFirstFix(src, "ASC010"));
+    }
 }

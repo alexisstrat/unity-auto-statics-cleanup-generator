@@ -601,6 +601,93 @@ public partial class Foo
         Assert.Contains(diags, d => d.Id == "ASC002");
         Assert.DoesNotContain("Items.Clear();", output);
     }
+
+    [Fact]
+    public void MemberLevelReadonlyCollectionWithoutInitializerEmitsAsc010AndIsSkipped()
+    {
+        // A readonly reference-type static with no initializer is null
+        // forever (it can only be assigned in an initializer or a static
+        // ctor, and ASC008 bans static ctors), so the Clear strategy would
+        // throw NullReferenceException on every play-mode transition.
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly List<int> MyList;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        var asc010 = diags.Single(d => d.Id == "ASC010");
+        Assert.Equal(DiagnosticSeverity.Error, asc010.Severity);
+        Assert.DoesNotContain("MyList.Clear();", output);
+    }
+
+    [Fact]
+    public void MemberLevelReadonlyCollectionWithNullInitializerEmitsAsc010()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly List<int> MyList = null;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC010");
+        Assert.DoesNotContain("MyList.Clear();", output);
+    }
+
+    [Fact]
+    public void MemberLevelReadonlyCollectionWithDefaultInitializerEmitsAsc010()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly List<int> MyList = default;
+}";
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC010");
+    }
+
+    [Fact]
+    public void ReadonlyManagedStructWithClearAndNoInitializerStillEmitsClear()
+    {
+        // A default struct instance is real state — Clear() is callable and
+        // resets it, so no ASC010 and the Clear strategy applies. (The struct
+        // holds a List so it isn't unmanaged, which would exempt it instead.)
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public struct Buffer { public List<int> Items; public void Clear() { Items = null; } }
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly Buffer B;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
+        Assert.Contains("B.Clear();", output);
+    }
+
+    [Fact]
+    public void GetOnlyCollectionAutoPropertyWithoutInitializerEmitsAsc010()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static List<int> Items { get; }
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC010");
+        Assert.DoesNotContain("Items.Clear();", output);
+    }
 }
 
 public class PartialDiagnosticTests
@@ -878,6 +965,26 @@ public partial class Foo
         // The generator still emits the healthy members.
         Assert.Contains("Fine = default;", output);
         Assert.DoesNotContain("Config C", output);
+    }
+
+    [Fact]
+    public void TypeLevelReadonlyNullAtCleanupEmitsAsc010()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    public static readonly List<int> MyList;
+    public static int Fine;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC010");
+        // The generator still emits the healthy members and skips the broken one.
+        Assert.Contains("Fine = default;", output);
+        Assert.DoesNotContain("MyList.Clear();", output);
     }
 
     [Fact]

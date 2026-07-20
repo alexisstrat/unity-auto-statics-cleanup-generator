@@ -5,17 +5,17 @@ using Microsoft.CodeAnalysis.Diagnostics;
 namespace AutoStaticsCleanup;
 
 /// <summary>
-/// Reports the ASC001-009 diagnostics for misuse of [AutoStaticsCleanup].
+/// Reports the ASC001-010 diagnostics for misuse of [AutoStaticsCleanup].
 /// Lives in the same assembly as the source generator but runs independently
 /// — the IDE surfaces these rules even when the generator isn't producing
 /// output, and they show up under Solution Explorer's analyzer node with
 /// proper severity-config affordances.
 ///
 /// Member-level [AutoStaticsCleanup] runs full shape validation (ASC002-007,
-/// ASC009 fire when the explicitly attributed member can't actually be
+/// ASC009/010 fire when the explicitly attributed member can't actually be
 /// reset). Type-level [AutoStaticsCleanup] verifies the partial chain
 /// (ASC001), the static-constructor rule (ASC008), and the shapes that can't
-/// be cleaned at all (ASC002/003/009 via Validation.ValidateTypeMembers);
+/// be cleaned at all (ASC002/003/009/010 via Validation.ValidateTypeMembers);
 /// merely-unfit members are silently skipped.
 /// </summary>
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
@@ -30,7 +30,8 @@ public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
             Validation.MemberMustBeStatic,
             Validation.ConstFieldNotSupported,
             Validation.StaticConstructorNotSupported,
-            Validation.DisposableNeedsInitializer);
+            Validation.DisposableNeedsInitializer,
+            Validation.ReadonlyNullAtCleanup);
 
     public override void Initialize(AnalysisContext context)
     {
