@@ -178,7 +178,7 @@ namespace AutoStaticsCleanup
         {
             if (change != PlayModeStateChange.ExitingEditMode
                 && change != PlayModeStateChange.EnteredEditMode) return;
-            
+
             var snapshot = DelegateAutoCleanup.RegisteredInstances.ToArray();
             foreach (var c in snapshot)
             {
@@ -199,7 +199,7 @@ namespace AutoStaticsCleanup
 
 ### 2. Drop the analyzer DLL into Unity
 
-Take the `AutoStaticsCleanup.dll` you produced in [Building](#building) and copy it into your Unity project under `Assets/` (a folder like `Assets/Plugins/AutoStaticsCleanup/` is conventional).
+Take the `AutoStaticsCleanup.dll` you produced in [Building from source](#building-from-source) and copy it into your Unity project under `Assets/` (a folder like `Assets/Plugins/AutoStaticsCleanup/` is conventional).
 
 In Unity's Project window, select the DLL to open the Plugin Inspector, then:
 

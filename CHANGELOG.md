@@ -24,6 +24,10 @@ behaves identically after an upgrade to Unity 6.5.
 
 ### Breaking changes
 
+- Generated code now registers cleanup through a static
+  `UnityEngine.DelegateAutoCleanup` field instead of a nested
+  `PlayModeScopeAutoCleanup` subclass, so the user-side helper files must be
+  replaced — see Upgrading above.
 - Manual (non-auto) properties are no longer reset.
   - A member-level attribute on one now errors (ASC003); under a class-level
     attribute it is silently skipped and keeps its value across play sessions.
