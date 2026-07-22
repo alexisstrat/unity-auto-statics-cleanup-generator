@@ -11,3 +11,12 @@ ASC004  | AutoStaticsCleanup | Error | [AutoStaticsCleanup] on a manual (non-fie
 ASC006  | AutoStaticsCleanup | Error | [AutoStaticsCleanup] on an instance member
 ASC007  | AutoStaticsCleanup | Error | [AutoStaticsCleanup] on a const field
 ASC008  | AutoStaticsCleanup | Error | [AutoStaticsCleanup] is incompatible with an explicit static constructor on the same type
+
+## Release 1.1
+
+### New Rules
+
+Rule ID | Category | Severity | Notes
+--------|----------|----------|-------
+ASC009  | AutoStaticsCleanup | Error | Disposable static without an initializer cannot be reset
+ASC010  | AutoStaticsCleanup | Error | Readonly member is null at cleanup time; the generated Clear() would throw

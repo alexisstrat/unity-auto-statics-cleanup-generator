@@ -16,7 +16,7 @@ namespace AutoStaticsCleanup;
 public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
 {
     public override ImmutableArray<string> FixableDiagnosticIds { get; } =
-        ImmutableArray.Create("ASC001", "ASC002", "ASC003", "ASC006");
+        ImmutableArray.Create("ASC001", "ASC002", "ASC003", "ASC006", "ASC010");
 
     public override FixAllProvider GetFixAllProvider() => WellKnownFixAllProviders.BatchFixer;
 
@@ -41,6 +41,9 @@ public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
                     break;
                 case "ASC006":
                     RegisterMakeStatic(context, root, node, diagnostic);
+                    break;
+                case "ASC010":
+                    await RegisterAddNewInitializerAsync(context, root, node, diagnostic).ConfigureAwait(false);
                     break;
             }
         }
@@ -192,6 +195,83 @@ public sealed class AutoStaticsCleanupCodeFixProvider : CodeFixProvider
         // before the type/return token) — matches conventional C# ordering.
         var newDecl = memberDecl.WithModifiers(memberDecl.Modifiers.Add(staticToken));
         return Task.FromResult(document.WithSyntaxRoot(root.ReplaceNode(memberDecl, newDecl)));
+    }
+
+    // -----------------------------------------------------------------
+    //  ASC010 — add `= new()` initializer
+    // -----------------------------------------------------------------
+
+    private static async Task RegisterAddNewInitializerAsync(
+        CodeFixContext context, SyntaxNode root, SyntaxNode node, Diagnostic diagnostic)
+    {
+        // ASC010 fires on readonly fields and getter-only auto-properties
+        // whose value is null at cleanup time. `= new()` only helps when the
+        // member type is actually constructible, so gate on a concrete class
+        // with a reachable parameterless constructor.
+        var fieldDecl = node.FirstAncestorOrSelf<FieldDeclarationSyntax>();
+        var propDecl = fieldDecl == null ? node.FirstAncestorOrSelf<PropertyDeclarationSyntax>() : null;
+        var typeSyntax = fieldDecl?.Declaration.Type ?? propDecl?.Type;
+        if (typeSyntax == null) return;
+
+        var semanticModel = await context.Document.GetSemanticModelAsync(context.CancellationToken).ConfigureAwait(false);
+        if (semanticModel?.GetTypeInfo(typeSyntax, context.CancellationToken).Type
+            is not INamedTypeSymbol { TypeKind: TypeKind.Class, IsAbstract: false } memberType)
+            return;
+
+        var hasUsableCtor = memberType.InstanceConstructors.Any(c =>
+            c.Parameters.Length == 0
+            && c.DeclaredAccessibility is Accessibility.Public or Accessibility.Internal);
+        if (!hasUsableCtor) return;
+
+        context.RegisterCodeFix(
+            CodeAction.Create(
+                title: "Initialize with 'new()'",
+                createChangedDocument: ct => AddNewInitializerAsync(context.Document, root, node, ct),
+                equivalenceKey: "ASC010_AddNewInitializer"),
+            diagnostic);
+    }
+
+    private static Task<Document> AddNewInitializerAsync(
+        Document document, SyntaxNode root, SyntaxNode node, CancellationToken ct)
+    {
+        var newExpr = SyntaxFactory.ImplicitObjectCreationExpression();
+
+        var declarator = node.FirstAncestorOrSelf<VariableDeclaratorSyntax>();
+        if (declarator != null)
+        {
+            // `= null` / `= default` — swap the value; no initializer — add one.
+            var newDeclarator = declarator.Initializer != null
+                ? declarator.WithInitializer(declarator.Initializer.WithValue(newExpr))
+                : declarator.WithInitializer(SyntaxFactory.EqualsValueClause(
+                    SyntaxFactory.Token(SyntaxKind.EqualsToken)
+                        .WithLeadingTrivia(SyntaxFactory.Space)
+                        .WithTrailingTrivia(SyntaxFactory.Space),
+                    newExpr));
+            return Task.FromResult(document.WithSyntaxRoot(root.ReplaceNode(declarator, newDeclarator)));
+        }
+
+        if (node.FirstAncestorOrSelf<PropertyDeclarationSyntax>() is not { AccessorList: not null } propDecl)
+            return Task.FromResult(document);
+
+        if (propDecl.Initializer != null)
+        {
+            var newDecl = propDecl.WithInitializer(propDecl.Initializer.WithValue(newExpr));
+            return Task.FromResult(document.WithSyntaxRoot(root.ReplaceNode(propDecl, newDecl)));
+        }
+
+        // `{ get; }` → `{ get; } = new();` — the accessor list's close brace
+        // carries the declaration's trailing trivia (newline); move it onto
+        // the new semicolon so the initializer stays on the same line.
+        var closeBrace = propDecl.AccessorList.CloseBraceToken;
+        var withInitializer = propDecl
+            .WithAccessorList(propDecl.AccessorList.WithCloseBraceToken(
+                closeBrace.WithTrailingTrivia(SyntaxFactory.Space)))
+            .WithInitializer(SyntaxFactory.EqualsValueClause(
+                SyntaxFactory.Token(SyntaxKind.EqualsToken).WithTrailingTrivia(SyntaxFactory.Space),
+                newExpr))
+            .WithSemicolonToken(SyntaxFactory.Token(SyntaxKind.SemicolonToken)
+                .WithTrailingTrivia(closeBrace.TrailingTrivia));
+        return Task.FromResult(document.WithSyntaxRoot(root.ReplaceNode(propDecl, withInitializer)));
     }
 
     // -----------------------------------------------------------------

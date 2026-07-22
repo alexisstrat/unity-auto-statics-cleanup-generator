@@ -20,10 +20,22 @@ namespace Unity.Scripting.LifecycleManagement
 
 namespace UnityEngine
 {
-    public abstract class PlayModeScopeAutoCleanup
+    public sealed class DelegateAutoCleanup
     {
-        protected PlayModeScopeAutoCleanup() { }
-        public abstract void Cleanup();
+        private readonly System.Action _cleanup;
+        private readonly string _ownerDescription;
+
+        public DelegateAutoCleanup(System.Action cleanup, string ownerDescription = """")
+        {
+            _cleanup = cleanup;
+            _ownerDescription = ownerDescription;
+        }
+
+        public void Cleanup() => _cleanup();
+        public override string ToString() => _ownerDescription;
+
+        public static DelegateAutoCleanup CreateForPlayMode(System.Action cleanup, string ownerDescription = """")
+            => new DelegateAutoCleanup(cleanup, ownerDescription);
     }
 }
 

@@ -170,6 +170,82 @@ public partial class Bar { [AutoStaticsCleanup] public static int Renamed; }",
             r == IncrementalStepRunReason.Cached || r == IncrementalStepRunReason.Unchanged));
     }
 
+    /// <summary>
+    /// PostClearStatements is an <c>ImmutableArray&lt;string&gt;</c> on
+    /// <c>ResetEntry</c>; if it ever falls back to the default reference-based
+    /// array equality (i.e. drops out of the ChainEquals set), every run
+    /// produces "different" entries and the cache is silently busted for any
+    /// type containing a readonly collection with a braced initializer.
+    /// </summary>
+    [Fact]
+    public void UnrelatedEditKeepsPostClearEntriesCached()
+    {
+        var refs = LoadRefs();
+
+        var stub = CSharpSyntaxTree.ParseText(GeneratorTestHelper.AttributeStub, path: "stub.cs");
+        var attributed = CSharpSyntaxTree.ParseText(@"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo { [AutoStaticsCleanup] public static readonly List<int> Items = new() { 1, 2 }; }",
+            path: "foo.cs");
+        var bystander = CSharpSyntaxTree.ParseText("// bystander", path: "bystander.cs");
+
+        var compilation = CSharpCompilation.Create("X",
+            new[] { stub, attributed, bystander }, refs);
+
+        GeneratorDriver driver = CSharpGeneratorDriver.Create(
+            new[] { new AutoStaticsCleanupGenerator().AsSourceGenerator() },
+            driverOptions: new GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true));
+
+        driver = driver.RunGenerators(compilation);
+
+        var newBystander = CSharpSyntaxTree.ParseText("// bystander\n// edit", path: "bystander.cs");
+        compilation = compilation.ReplaceSyntaxTree(bystander, newBystander);
+        driver = driver.RunGenerators(compilation);
+
+        var run = driver.GetRunResult().Results.Single();
+        AssertAllOutputsAreCacheHits(run, "result_ForAttributeWithMetadataName");
+        AssertAllOutputsAreCacheHits(run, "SourceOutput");
+    }
+
+    /// <summary>
+    /// The complementary direction: editing a braced initializer element must
+    /// flow through to the regenerated post-Clear restoration statements.
+    /// </summary>
+    [Fact]
+    public void EditingBracedInitializerElementRegeneratesPostClearStatements()
+    {
+        var refs = LoadRefs();
+
+        var stub = CSharpSyntaxTree.ParseText(GeneratorTestHelper.AttributeStub, path: "stub.cs");
+        var fooTree = CSharpSyntaxTree.ParseText(@"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo { [AutoStaticsCleanup] public static readonly List<int> Items = new() { 1, 2 }; }",
+            path: "foo.cs");
+
+        var compilation = CSharpCompilation.Create("X", new[] { stub, fooTree }, refs);
+
+        GeneratorDriver driver = CSharpGeneratorDriver.Create(
+            new[] { new AutoStaticsCleanupGenerator().AsSourceGenerator() },
+            driverOptions: new GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true));
+
+        driver = driver.RunGenerators(compilation);
+
+        var newFoo = CSharpSyntaxTree.ParseText(@"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo { [AutoStaticsCleanup] public static readonly List<int> Items = new() { 1, 3 }; }",
+            path: "foo.cs");
+        compilation = compilation.ReplaceSyntaxTree(fooTree, newFoo);
+        driver = driver.RunGenerators(compilation);
+
+        var generated = driver.GetRunResult().Results.Single()
+            .GeneratedSources.Single().SourceText.ToString();
+        Assert.Contains("Items.Add(3);", generated);
+        Assert.DoesNotContain("Items.Add(2);", generated);
+    }
+
     private static void AssertAllOutputsAreCacheHits(GeneratorRunResult run, string stepName)
     {
         if (!run.TrackedSteps.TryGetValue(stepName, out var steps)) return;

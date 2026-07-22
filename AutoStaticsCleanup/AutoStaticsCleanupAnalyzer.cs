@@ -5,17 +5,18 @@ using Microsoft.CodeAnalysis.Diagnostics;
 namespace AutoStaticsCleanup;
 
 /// <summary>
-/// Reports the ASC001-007 diagnostics for misuse of [AutoStaticsCleanup].
+/// Reports the ASC001-010 diagnostics for misuse of [AutoStaticsCleanup].
 /// Lives in the same assembly as the source generator but runs independently
 /// — the IDE surfaces these rules even when the generator isn't producing
 /// output, and they show up under Solution Explorer's analyzer node with
 /// proper severity-config affordances.
 ///
-/// Member-level [AutoStaticsCleanup] runs full shape validation (ASC002-007
-/// fire when the explicitly attributed member can't actually be reset).
-/// Type-level [AutoStaticsCleanup] only verifies the partial chain (ASC001);
-/// unfit members on a class-level scan are silently filtered to match the
-/// Unity 6.5 source generator's behavior.
+/// Member-level [AutoStaticsCleanup] runs full shape validation (ASC002-007,
+/// ASC009/010 fire when the explicitly attributed member can't actually be
+/// reset). Type-level [AutoStaticsCleanup] verifies the partial chain
+/// (ASC001), the static-constructor rule (ASC008), and the shapes that can't
+/// be cleaned at all (ASC002/003/009/010 via Validation.ValidateTypeMembers);
+/// merely-unfit members are silently skipped.
 /// </summary>
 [DiagnosticAnalyzer(LanguageNames.CSharp)]
 public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
@@ -28,7 +29,9 @@ public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
             Validation.ManualEventNotSupported,
             Validation.MemberMustBeStatic,
             Validation.ConstFieldNotSupported,
-            Validation.StaticConstructorNotSupported);
+            Validation.StaticConstructorNotSupported,
+            Validation.DisposableNeedsInitializer,
+            Validation.ReadonlyNullAtCleanup);
 
     public override void Initialize(AnalysisContext context)
     {
@@ -66,7 +69,7 @@ public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
         switch (symbol)
         {
             case INamedTypeSymbol type:
-                AnalyzeType(context, type);
+                AnalyzeType(context, type, attr, noAttr);
                 break;
             case IFieldSymbol field:
                 Report(context, Validation.ValidateField(field));
@@ -81,14 +84,17 @@ public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
     }
 
     /// <summary>
-    /// Type-level [AutoStaticsCleanup] dispatch: only verify the partial chain.
-    /// Unfit members (instance, const, readonly, manual event, etc.) are
-    /// silently filtered by the generator at codegen time; we don't warn on
-    /// them at the type-level scan because the user's mental model is "reset
-    /// what's resettable, leave the rest alone." Warnings are reserved for
-    /// explicit member-level attribution.
+    /// Type-level [AutoStaticsCleanup] dispatch: verify the partial chain and
+    /// the static-constructor rule, then walk the members for the shapes that
+    /// can't be cleaned at all (readonly non-cleanable, disposable without
+    /// initializer) — those must error rather than be skipped silently.
+    /// Merely-unfit shapes (instance, const, manual event, non-auto property,
+    /// exempt readonly) stay silent here; the user's mental model for a
+    /// class-level attribute is "reset what's resettable, leave the rest
+    /// alone."
     /// </summary>
-    private static void AnalyzeType(SymbolAnalysisContext context, INamedTypeSymbol type)
+    private static void AnalyzeType(
+        SymbolAnalysisContext context, INamedTypeSymbol type, INamedTypeSymbol attr, INamedTypeSymbol noAttr)
     {
         if (!Validation.IsPartialChain(type))
         {
@@ -97,6 +103,8 @@ public sealed class AutoStaticsCleanupAnalyzer : DiagnosticAnalyzer
         }
         if (Validation.HasExplicitStaticConstructor(type))
             context.ReportDiagnostic(Validation.CreateStaticCtorDiagnostic(type, type));
+
+        Validation.ValidateTypeMembers(type, attr, noAttr, context.ReportDiagnostic);
     }
 
     private static void Report(SymbolAnalysisContext context, Diagnostic diagnostic)

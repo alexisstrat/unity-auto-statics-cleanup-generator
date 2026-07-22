@@ -43,3 +43,5 @@ Thumbs.db
 
 # BenchmarkDotNet
 BenchmarkDotNet.Artifacts/
+
+*.unitypackage

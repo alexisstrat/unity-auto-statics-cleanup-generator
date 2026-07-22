@@ -106,7 +106,8 @@ public partial class Foo
     [AutoStaticsCleanup] private static MyDisposable _d = new MyDisposable();
 }";
         var output = Run(src);
-        Assert.Contains("if(_d is not null) { _d.Dispose(); _d = new MyDisposable(); }", output);
+        // `){` with no space is the pinned output format.
+        Assert.Contains("if(_d is not null){ _d.Dispose(); _d = new MyDisposable(); }", output);
     }
 
     [Fact]
@@ -125,11 +126,11 @@ public partial class Foo
     }
 
     [Fact]
-    public void IDisposableFieldWithoutInitializerDoesNotEmitDispose()
+    public void DisposableFieldWithoutInitializerIsSkippedAndEmitsAsc009()
     {
-        // No init expression to reassign to — Dispose without reassign would
-        // leave the field pointing at a disposed instance. Skip Dispose; the
-        // null-guarded `_d = default` is the safest fallback.
+        // Nothing to construct a replacement from after disposing, and
+        // resetting to default without disposing would leak the old instance
+        // — the member is skipped and flagged instead.
         const string src = @"
 using System;
 using Unity.Scripting.LifecycleManagement;
@@ -139,8 +140,44 @@ public partial class Foo
     [AutoStaticsCleanup] private static MyDisposable _d;
 }";
         var output = Run(src);
-        Assert.DoesNotContain("Dispose", output);
-        Assert.Contains("if(_d is not null) _d = default;", output);
+        var diags = AnalyzerTestHelper.Run(src);
+        var asc009 = diags.Single(d => d.Id == "ASC009");
+        Assert.Equal(DiagnosticSeverity.Error, asc009.Severity);
+        Assert.DoesNotContain("_d", output);
+    }
+
+    [Fact]
+    public void DisposablePropertyWithoutInitializerIsSkippedAndEmitsAsc009()
+    {
+        const string src = @"
+using System;
+using Unity.Scripting.LifecycleManagement;
+public class MyDisposable : IDisposable { public void Dispose() {} }
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static MyDisposable D { get; set; }
+}";
+        var output = Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC009");
+        Assert.DoesNotContain("D =", output);
+    }
+
+    [Fact]
+    public void DisposableFieldWithNullInitializerStillEmitsDispose()
+    {
+        // `= null` IS an initializer — it's captured verbatim and the
+        // dispose-then-reassign shape is emitted.
+        const string src = @"
+using System;
+using Unity.Scripting.LifecycleManagement;
+public class MyDisposable : IDisposable { public void Dispose() {} }
+public partial class Foo
+{
+    [AutoStaticsCleanup] private static MyDisposable _d = null;
+}";
+        var output = Run(src);
+        Assert.Contains("if(_d is not null){ _d.Dispose(); _d = null; }", output);
     }
 
     [Fact]
@@ -158,8 +195,11 @@ public partial class Foo
     }
 
     [Fact]
-    public void GenericIDisposableConstrainedFieldEmitsDispose()
+    public void GenericIDisposableConstrainedFieldDoesNotEmitDispose()
     {
+        // Dispose detection is duck-typed by method name: type parameters
+        // have no members of their own, so a T constrained to IDisposable
+        // does NOT get a Dispose() call.
         const string src = @"
 using System;
 using Unity.Scripting.LifecycleManagement;
@@ -168,7 +208,24 @@ public partial class Bag<T> where T : IDisposable, new()
     [AutoStaticsCleanup] private static T _x = new T();
 }";
         var output = Run(src);
-        Assert.Contains("_x.Dispose();", output);
+        Assert.DoesNotContain("Dispose", output);
+        Assert.Contains("_x = new T();", output);
+    }
+
+    [Fact]
+    public void DuckTypedDisposeWithoutIDisposableEmitsDispose()
+    {
+        // Conversely, a Dispose() method counts even when the type never
+        // implements IDisposable — detection is by method name only.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public class Handle { public void Dispose() {} }
+public partial class Foo
+{
+    [AutoStaticsCleanup] private static Handle _h = new Handle();
+}";
+        var output = Run(src);
+        Assert.Contains("if(_h is not null){ _h.Dispose(); _h = new Handle(); }", output);
     }
 
     [Fact]
@@ -205,10 +262,10 @@ public partial class Foo
     }
 
     [Fact]
-    public void ReadonlyCollectionWithCollectionInitializerEmitsAsc002AndIsSkipped()
+    public void ReadonlyCollectionWithCollectionInitializerEmitsClearAndRestoresElements()
     {
-        // Non-trivial initializer ({ 1, 2, 3 }) — Clear() would empty the list,
-        // not restore [1,2,3]. ASC002 warns; the field is skipped from output.
+        // Braced initializer elements are restored after Clear()
+        // (PostClearStatements). No diagnostic; this shape is fully supported.
         const string src = @"
 using System.Collections.Generic;
 using Unity.Scripting.LifecycleManagement;
@@ -218,8 +275,57 @@ public partial class Foo
 }";
         var output = Run(src);
         var diags = AnalyzerTestHelper.Run(src);
-        Assert.Contains(diags, d => d.Id == "ASC002");
-        Assert.DoesNotContain("Items", output);
+        Assert.Empty(diags);
+        Assert.Contains("Items.Clear();", output);
+        Assert.Contains("Items.Add(1);", output);
+        Assert.Contains("Items.Add(2);", output);
+        Assert.Contains("Items.Add(3);", output);
+        Assert.DoesNotContain("Items =", output);
+    }
+
+    [Fact]
+    public void ReadonlyDictionaryWithComplexInitializerRestoresViaIndexer()
+    {
+        // Two-expression initializer elements ({ "k", 1 }) become indexer
+        // writes.
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly Dictionary<string, int> Map = new() { { ""a"", 1 }, { ""b"", 2 } };
+}";
+        var output = Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
+        Assert.Contains("Map.Clear();", output);
+        Assert.Contains("Map[\"a\"] = 1;", output);
+        Assert.Contains("Map[\"b\"] = 2;", output);
+    }
+
+    [Fact]
+    public void ReadonlyExemptTypesAreSilentlySkipped()
+    {
+        // Readonly unmanaged / string / whitelisted-immutable (System.Uri) /
+        // arrays of unmanaged are exempt — neither reset nor flagged, even
+        // with an explicit member-level attribute.
+        const string src = @"
+using System;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly int Number = 5;
+    [AutoStaticsCleanup] public static readonly string Text = ""hi"";
+    [AutoStaticsCleanup] public static readonly Uri Endpoint = new Uri(""https://x"");
+    [AutoStaticsCleanup] public static readonly int[] Table = { 1, 2 };
+}";
+        var output = Run(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
+        Assert.DoesNotContain("Number", output);
+        Assert.DoesNotContain("Text", output);
+        Assert.DoesNotContain("Endpoint", output);
+        Assert.DoesNotContain("Table", output);
     }
 
     [Fact]
@@ -272,8 +378,11 @@ public partial class Foo
     }
 
     [Fact]
-    public void ManualPropertyWithSetterEmitsAssignment()
+    public void ManualPropertyWithSetterIsSkippedAndEmitsAsc003()
     {
+        // Only auto-properties are reset — a manual property is never
+        // collected; it's skipped by the generator and flagged by the
+        // analyzer instead.
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
 public partial class Foo
@@ -283,7 +392,9 @@ public partial class Foo
     public static int Counter { get { return _x; } set { _x = value; } }
 }";
         var output = Run(src);
-        Assert.Contains("Counter = default;", output);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC003");
+        Assert.DoesNotContain("Counter = ", output);
     }
 
     [Fact]
@@ -303,8 +414,10 @@ public partial class Foo
     }
 
     [Fact]
-    public void GetOnlyAutoPropertyEmitsAsc003AndIsSkipped()
+    public void GetOnlyExemptAutoPropertyIsSilentlySkipped()
     {
+        // Getter-only auto-properties follow the readonly-field rules: an
+        // unmanaged type is exempt — silently skipped, no ASC003.
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
 public partial class Foo
@@ -313,9 +426,46 @@ public partial class Foo
 }";
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
+        Assert.DoesNotContain("Counter", output);
+    }
+
+    [Fact]
+    public void GetOnlyAutoPropertyWithoutClearEmitsAsc003AndIsSkipped()
+    {
+        // Non-exempt type with no Clear() — can't be reset through a getter,
+        // so ASC003 fires and the property is skipped.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static object Blob { get; } = new object();
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
         var asc003 = diags.Single(d => d.Id == "ASC003");
         Assert.Equal(DiagnosticSeverity.Error, asc003.Severity);
-        Assert.DoesNotContain("Counter", output);
+        Assert.DoesNotContain("Blob", output);
+    }
+
+    [Fact]
+    public void GetOnlyCollectionAutoPropertyEmitsClearAndRestoresElements()
+    {
+        // Getter-only auto-property of a Clear-able collection follows the
+        // readonly Clear strategy, including element restoration.
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static List<string> Names { get; } = new() { ""a"" };
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
+        Assert.Contains("Names.Clear();", output);
+        Assert.Contains("Names.Add(\"a\");", output);
+        Assert.DoesNotContain("Names =", output);
     }
 
     // Note: `init` accessors only apply to instance properties; the C# compiler
@@ -334,7 +484,7 @@ public partial class Foo
     [AutoStaticsCleanup] public static MyDisposable D { get; set; } = new MyDisposable();
 }";
         var output = Run(src);
-        Assert.Contains("if(D is not null) { D.Dispose(); D = new MyDisposable(); }", output);
+        Assert.Contains("if(D is not null){ D.Dispose(); D = new MyDisposable(); }", output);
     }
 }
 
@@ -354,13 +504,14 @@ public partial class Bus
 }";
         var output = Run(src);
         Assert.Contains("if(OnSomething != null)", output);
-        Assert.Contains("foreach(global::System.Action handler in OnSomething.GetInvocationList())", output);
+        Assert.Contains("foreach(System.Action handler in OnSomething.GetInvocationList())", output);
         Assert.Contains("OnSomething -= handler;", output);
     }
 
     [Fact]
-    public void GenericDelegateEventUsesFullyQualifiedDelegateType()
+    public void GenericDelegateEventUsesNamespaceQualifiedDelegateType()
     {
+        // Default display format — namespace-qualified, no global::.
         const string src = @"
 using System;
 using Unity.Scripting.LifecycleManagement;
@@ -369,7 +520,27 @@ public partial class Bus
     [AutoStaticsCleanup] public static event Action<int, string> OnSomething;
 }";
         var output = Run(src);
-        Assert.Contains("foreach(global::System.Action<int, string> handler in OnSomething.GetInvocationList())", output);
+        Assert.Contains("foreach(System.Action<int, string> handler in OnSomething.GetInvocationList())", output);
+    }
+
+    [Fact]
+    public void FieldsAreEmittedBeforePropertiesRegardlessOfSourceOrder()
+    {
+        // All fields, then all properties, then all events — not interleaved
+        // source order.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    public static int Prop { get; set; } = 1;
+    public static int Field = 2;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var fieldIdx = output.IndexOf("Field = 2;");
+        var propIdx = output.IndexOf("Prop = 1;");
+        Assert.True(fieldIdx > 0 && propIdx > 0);
+        Assert.True(fieldIdx < propIdx, "Fields must precede properties in the cleanup method");
     }
 
     [Fact]
@@ -394,19 +565,128 @@ public partial class Foo
 public class ReadonlyFieldTests
 {
     [Fact]
-    public void MemberLevelReadonlyFieldEmitsAsc002AndIsSkipped()
+    public void MemberLevelReadonlyFieldWithoutClearEmitsAsc002AndIsSkipped()
     {
+        // Non-exempt readonly type with no Clear() — nothing we can do with
+        // it, so ASC002 fires and the field is skipped.
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
+public class Config { }
 public partial class Foo
 {
-    [AutoStaticsCleanup] public static readonly int Constant = 5;
+    [AutoStaticsCleanup] public static readonly Config C = new Config();
 }";
         var output = GeneratorTestHelper.RunGenerator(src);
         var diags = AnalyzerTestHelper.Run(src);
         var asc002 = diags.Single(d => d.Id == "ASC002");
         Assert.Equal(DiagnosticSeverity.Error, asc002.Severity);
-        Assert.DoesNotContain("Constant", output);
+        Assert.DoesNotContain("Config C", output);
+    }
+
+    [Fact]
+    public void MemberLevelReadonlyFieldWithNonCreationInitializerEmitsAsc002()
+    {
+        // Even with a Clear() available, a non-'new' initializer (factory
+        // call) can't be restored after Clear() — ASC002.
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    public static List<int> Make() => new List<int>();
+    [AutoStaticsCleanup] public static readonly List<int> Items = Make();
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC002");
+        Assert.DoesNotContain("Items.Clear();", output);
+    }
+
+    [Fact]
+    public void MemberLevelReadonlyCollectionWithoutInitializerEmitsAsc010AndIsSkipped()
+    {
+        // A readonly reference-type static with no initializer is null
+        // forever (it can only be assigned in an initializer or a static
+        // ctor, and ASC008 bans static ctors), so the Clear strategy would
+        // throw NullReferenceException on every play-mode transition.
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly List<int> MyList;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        var asc010 = diags.Single(d => d.Id == "ASC010");
+        Assert.Equal(DiagnosticSeverity.Error, asc010.Severity);
+        Assert.DoesNotContain("MyList.Clear();", output);
+    }
+
+    [Fact]
+    public void MemberLevelReadonlyCollectionWithNullInitializerEmitsAsc010()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly List<int> MyList = null;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC010");
+        Assert.DoesNotContain("MyList.Clear();", output);
+    }
+
+    [Fact]
+    public void MemberLevelReadonlyCollectionWithDefaultInitializerEmitsAsc010()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly List<int> MyList = default;
+}";
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC010");
+    }
+
+    [Fact]
+    public void ReadonlyManagedStructWithClearAndNoInitializerStillEmitsClear()
+    {
+        // A default struct instance is real state — Clear() is callable and
+        // resets it, so no ASC010 and the Clear strategy applies. (The struct
+        // holds a List so it isn't unmanaged, which would exempt it instead.)
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public struct Buffer { public List<int> Items; public void Clear() { Items = null; } }
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly Buffer B;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
+        Assert.Contains("B.Clear();", output);
+    }
+
+    [Fact]
+    public void GetOnlyCollectionAutoPropertyWithoutInitializerEmitsAsc010()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static List<int> Items { get; }
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC010");
+        Assert.DoesNotContain("Items.Clear();", output);
     }
 }
 
@@ -609,6 +889,7 @@ public partial class Foo
     public static readonly int Constant = 5;
     private static Action _backing;
     public static event Action E { add { _backing += value; } remove { _backing -= value; } }
+    public static int Manual { get { return 0; } set { } }
     public static int Counter;
 }";
         var output = GeneratorTestHelper.RunGenerator(src);
@@ -619,6 +900,154 @@ public partial class Foo
         Assert.DoesNotContain("Instance", output);
         Assert.DoesNotContain("Constant", output);
         Assert.DoesNotContain("E ", output);
+        Assert.DoesNotContain("Manual", output);
+    }
+}
+
+public class StructTests
+{
+    [Fact]
+    public void PartialStructEmitsPartialStructDeclaration()
+    {
+        // A `partial class` declaration would not merge with the user's
+        // struct (CS0261) — the declaration keyword must match per level.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial struct Holder
+{
+    [AutoStaticsCleanup] public static int Counter;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        Assert.Contains("partial struct Holder", output);
+        Assert.DoesNotContain("partial class Holder", output);
+        Assert.Contains("Counter = default;", output);
+    }
+
+    [Fact]
+    public void ClassNestedInStructEmitsMixedChain()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial struct Outer
+{
+    public partial class Inner
+    {
+        [AutoStaticsCleanup] public static int Counter;
+    }
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        Assert.Contains("partial struct Outer", output);
+        Assert.Contains("partial class Inner", output);
+        Assert.Contains("\"Outer.Inner\"", output);
+    }
+}
+
+public class TypeLevelRefusedShapeTests
+{
+    // These shapes can't be cleaned at all, even when only the class carries
+    // the attribute — they must error rather than be skipped silently.
+
+    [Fact]
+    public void TypeLevelReadonlyWithoutClearEmitsAsc002()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public class Config { }
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    public static readonly Config C = new Config();
+    public static int Fine;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC002");
+        // The generator still emits the healthy members.
+        Assert.Contains("Fine = default;", output);
+        Assert.DoesNotContain("Config C", output);
+    }
+
+    [Fact]
+    public void TypeLevelReadonlyNullAtCleanupEmitsAsc010()
+    {
+        const string src = @"
+using System.Collections.Generic;
+using Unity.Scripting.LifecycleManagement;
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    public static readonly List<int> MyList;
+    public static int Fine;
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC010");
+        // The generator still emits the healthy members and skips the broken one.
+        Assert.Contains("Fine = default;", output);
+        Assert.DoesNotContain("MyList.Clear();", output);
+    }
+
+    [Fact]
+    public void TypeLevelDisposableWithoutInitializerEmitsAsc009()
+    {
+        const string src = @"
+using System;
+using Unity.Scripting.LifecycleManagement;
+public class MyDisposable : IDisposable { public void Dispose() {} }
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    public static MyDisposable D;
+}";
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC009");
+    }
+
+    [Fact]
+    public void TypeLevelGetOnlyAutoPropertyWithoutClearEmitsAsc003()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    public static object Blob { get; } = new object();
+}";
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Contains(diags, d => d.Id == "ASC003");
+    }
+
+    [Fact]
+    public void TypeLevelRefusedShapeWithMemberAttributeReportsOnce()
+    {
+        // The member carries its own attribute, so the member-level Validate*
+        // path reports it; the class-level walk must skip it to avoid a
+        // duplicate diagnostic.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public class Config { }
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    [AutoStaticsCleanup] public static readonly Config C = new Config();
+}";
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Single(diags, d => d.Id == "ASC002");
+    }
+
+    [Fact]
+    public void TypeLevelRefusedShapeWithOptOutIsSilent()
+    {
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public class Config { }
+[AutoStaticsCleanup]
+public partial class Foo
+{
+    [NoAutoStaticsCleanup] public static readonly Config C = new Config();
+}";
+        var diags = AnalyzerTestHelper.Run(src);
+        Assert.Empty(diags);
     }
 }
 
@@ -910,8 +1339,10 @@ public partial class Foo
     }
 
     [Fact]
-    public void GeneratedNestedClassExtendsPlayModeScopeAutoCleanup()
+    public void GeneratedShapeIsStaticMethodPlusDelegateAutoCleanupRegistration()
     {
+        // The Action-based shape: one static cleanup method plus one
+        // DelegateAutoCleanup registration field — no nested type.
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
 public partial class Foo
@@ -920,15 +1351,75 @@ public partial class Foo
 }";
         var output = GeneratorTestHelper.RunGenerator(src);
         Assert.Contains(
-            "class UnityEngine_PlayModeScopeAutoCleanup_Both_AutoCleanupType : UnityEngine.PlayModeScopeAutoCleanup",
+            "static void __AutoStaticsCleanup_UnityEngine_PlayModeScope_Both()",
             output);
         Assert.Contains(
-            "static readonly UnityEngine_PlayModeScopeAutoCleanup_Both_AutoCleanupType _UnityEngine_PlayModeScopeAutoCleanup_Both_AutoCleanupType = new();",
+            "static readonly UnityEngine.DelegateAutoCleanup __autoCleanup_UnityEngine_PlayModeScope_Both = "
+            + "UnityEngine.DelegateAutoCleanup.CreateForPlayMode(__AutoStaticsCleanup_UnityEngine_PlayModeScope_Both, \"Foo\");",
             output);
+        Assert.DoesNotContain("AutoCleanupType", output);
+        Assert.DoesNotContain("override", output);
     }
 
     [Fact]
-    public void CompilerGeneratedAttributeOnNestedClassAndField()
+    public void OwnerDescriptionUsesDottedPathWithFlattenedGenerics()
+    {
+        // ownerDescription is the dotted type path — Namespace.Outer.Inner —
+        // with < and > flattened to underscores.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+namespace MyNs
+{
+    public partial class Outer<T>
+    {
+        public partial class Inner
+        {
+            [AutoStaticsCleanup] public static object State;
+        }
+    }
+}";
+        var output = GeneratorTestHelper.RunGenerator(src);
+        Assert.Contains("\"MyNs.Outer_T_.Inner\"", output);
+    }
+
+    [Fact]
+    public void GeneratedFileMatchesPinnedOutputByteForByte()
+    {
+        // The definitive output regression net: the whole generated file is
+        // pinned byte-for-byte — any drift in layout, naming, or statement
+        // shapes fails here first.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public static partial class StaticClass
+{
+    [AutoStaticsCleanup] public static int MyInt = 0;
+}";
+        var files = GeneratorTestHelper.RunFiles(src);
+        var generated = Assert.Single(files).Source.Replace("\r\n", "\n");
+
+        const string expected =
+            "// <auto-generated/>\n"
+            + "#if !UNITY_6000_5_OR_NEWER\n"
+            + "#pragma warning disable CS0618\n"
+            + "using Unity.Scripting.LifecycleManagement;\n"
+            + "\n"
+            + "partial class StaticClass\n"
+            + "{\n"
+            + "    [System.Runtime.CompilerServices.CompilerGenerated]\n"
+            + "    static void __AutoStaticsCleanup_UnityEngine_PlayModeScope_Both()\n"
+            + "    {\n"
+            + "        MyInt = 0;\n"
+            + "    }\n"
+            + "    [System.Runtime.CompilerServices.CompilerGenerated]\n"
+            + "    static readonly UnityEngine.DelegateAutoCleanup __autoCleanup_UnityEngine_PlayModeScope_Both = UnityEngine.DelegateAutoCleanup.CreateForPlayMode(__AutoStaticsCleanup_UnityEngine_PlayModeScope_Both, \"StaticClass\");\n"
+            + "}\n"
+            + "#pragma warning restore CS0618\n"
+            + "#endif\n";
+        Assert.Equal(expected, generated);
+    }
+
+    [Fact]
+    public void CompilerGeneratedAttributeOnCleanupMethodAndRegistrationField()
     {
         const string src = @"
 using Unity.Scripting.LifecycleManagement;

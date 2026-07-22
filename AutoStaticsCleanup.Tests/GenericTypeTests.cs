@@ -8,14 +8,29 @@ public class GenericTypeTests
     private static string Run(string src) => GeneratorTestHelper.RunGenerator(src);
 
     [Fact]
-    public void UnconstrainedTypeParameterFieldGuards()
+    public void UnconstrainedTypeParameterFieldDoesNotGuard()
     {
-        // Even with no class constraint Unity emits the guard, because `default`
-        // for an unconstrained T is "null or default-value" and the pattern is
-        // valid in both shapes.
+        // The null guard applies to reference types only; an unconstrained T
+        // is not known to be a reference type, so the bare assignment is
+        // emitted.
         const string src = @"
 using Unity.Scripting.LifecycleManagement;
 public partial class Bus<T>
+{
+    [AutoStaticsCleanup] private static T _x;
+}";
+        var output = Run(src);
+        Assert.Contains("_x = default;", output);
+        Assert.DoesNotContain("if(_x", output);
+    }
+
+    [Fact]
+    public void ClassConstrainedTypeParameterFieldGuards()
+    {
+        // `where T : class` makes T a reference type — the guard comes back.
+        const string src = @"
+using Unity.Scripting.LifecycleManagement;
+public partial class Bus<T> where T : class
 {
     [AutoStaticsCleanup] private static T _x;
 }";
@@ -35,8 +50,8 @@ public partial class Pair<T1, T2>
 }";
         var output = Run(src);
         Assert.Contains("partial class Pair<T1, T2>", output);
-        Assert.Contains("if(_a is not null) _a = default;", output);
-        Assert.Contains("if(_b is not null) _b = default;", output);
+        Assert.Contains("_a = default;", output);
+        Assert.Contains("_b = default;", output);
     }
 
     [Fact]
@@ -65,7 +80,7 @@ public partial class Bus<T>
     [AutoStaticsCleanup] public static event Action<T> OnSomething;
 }";
         var output = Run(src);
-        Assert.Contains("foreach(global::System.Action<T> handler in OnSomething.GetInvocationList())", output);
+        Assert.Contains("foreach(System.Action<T> handler in OnSomething.GetInvocationList())", output);
     }
 
     [Fact]

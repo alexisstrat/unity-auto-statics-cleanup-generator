@@ -15,17 +15,22 @@ namespace AutoStaticsCleanup;
 public class AutoStaticsCleanupGenerator : IIncrementalGenerator
 {
     // Names of symbols emitted into the generated file. Centralised so emission
-    // and tests share a single source of truth.
-    private const string CleanupBaseTypeFullName = "UnityEngine.PlayModeScopeAutoCleanup";
-    private const string NestedClassName = "UnityEngine_PlayModeScopeAutoCleanup_Both_AutoCleanupType";
-    private const string StaticFieldName = "_UnityEngine_PlayModeScopeAutoCleanup_Both_AutoCleanupType";
+    // and tests share a single source of truth. The method/field names encode
+    // the trigger key — "{ScopeType with '.'→'_'}_{ScopeTransitionType}" —
+    // and only the PlayModeScope/Both trigger is ever emitted (the only one
+    // DelegateAutoCleanup.CreateForPlayMode's public surface allows).
+    private const string DelegateCleanupTypeFullName = "UnityEngine.DelegateAutoCleanup";
+    private const string CleanupMethodName = "__AutoStaticsCleanup_UnityEngine_PlayModeScope_Both";
+    private const string RegistrationFieldName = "__autoCleanup_UnityEngine_PlayModeScope_Both";
     private const string CompilerGeneratedAttr = "[System.Runtime.CompilerServices.CompilerGenerated]";
 
     // -----------------------------------------------------------------
     //  Cacheable models
     // -----------------------------------------------------------------
 
-    private enum MemberKind : byte { Assign, Event }
+    // Numeric order doubles as emission order: all fields, then all
+    // properties, then all events (each group in declaration order).
+    private enum MemberKind : byte { Field, Property, Event }
 
     /// <summary>
     /// One static member that needs resetting on a play-mode transition.
@@ -37,16 +42,33 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         public string ContainingTypeKey { get; init; }
         public string Namespace { get; init; }
         public ImmutableArray<string> PartialChain { get; init; }
+
+        /// <summary>
+        /// Parallel to <see cref="PartialChain"/>: true where the outer type
+        /// is a struct — a `partial class` declaration won't merge with a
+        /// struct (CS0261), so the keyword must match per level.
+        /// </summary>
+        public ImmutableArray<bool> PartialChainIsStruct { get; init; }
+
         public string SelfTypeDecl { get; init; }
+        public bool SelfIsStruct { get; init; }
         public string MemberName { get; init; }
         public MemberKind Kind { get; init; }
-        public string DelegateTypeFq { get; init; }
+        public string DelegateTypeName { get; init; }
         public bool RequiresGuard { get; init; }
         public bool RequiresDispose { get; init; }
         public bool RequiresClear { get; init; }
         public string Initializer { get; init; }
         public int SourceOrder { get; init; }
         public ImmutableArray<string> FileUsings { get; init; }
+
+        /// <summary>
+        /// For readonly collection members reset via Clear(): the rendered
+        /// statements that restore the initializer's braced elements afterwards
+        /// (<c>Foo.Add(1);</c> / <c>Bar["k"] = "v";</c>). Empty for everything
+        /// else.
+        /// </summary>
+        public ImmutableArray<string> PostClearStatements { get; init; }
 
         /// <summary>
         /// Namespaces of every symbol referenced by the captured initializer
@@ -60,16 +82,19 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             ContainingTypeKey == other.ContainingTypeKey &&
             Namespace == other.Namespace &&
             ChainEquals(PartialChain, other.PartialChain) &&
+            BoolChainEquals(PartialChainIsStruct, other.PartialChainIsStruct) &&
             SelfTypeDecl == other.SelfTypeDecl &&
+            SelfIsStruct == other.SelfIsStruct &&
             MemberName == other.MemberName &&
             Kind == other.Kind &&
-            DelegateTypeFq == other.DelegateTypeFq &&
+            DelegateTypeName == other.DelegateTypeName &&
             RequiresGuard == other.RequiresGuard &&
             RequiresDispose == other.RequiresDispose &&
             RequiresClear == other.RequiresClear &&
             Initializer == other.Initializer &&
             SourceOrder == other.SourceOrder &&
             ChainEquals(FileUsings, other.FileUsings) &&
+            ChainEquals(PostClearStatements, other.PostClearStatements) &&
             ChainEquals(InitializerNamespaces, other.InitializerNamespaces);
 
         public override bool Equals(object obj) => obj is ResetEntry other && Equals(other);
@@ -87,6 +112,16 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         }
 
         private static bool ChainEquals(ImmutableArray<string> a, ImmutableArray<string> b)
+        {
+            if (a.IsDefault) return b.IsDefault;
+            if (b.IsDefault || a.Length != b.Length) return false;
+            for (var i = 0; i < a.Length; i++)
+                if (a[i] != b[i])
+                    return false;
+            return true;
+        }
+
+        private static bool BoolChainEquals(ImmutableArray<bool> a, ImmutableArray<bool> b)
         {
             if (a.IsDefault) return b.IsDefault;
             if (b.IsDefault || a.Length != b.Length) return false;
@@ -344,15 +379,23 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         public string ContainingTypeKey { get; init; }
         public string Namespace { get; init; }
         public ImmutableArray<string> PartialChain { get; init; }
+        public ImmutableArray<bool> PartialChainIsStruct { get; init; }
         public string SelfTypeDecl { get; init; }
+        public bool SelfIsStruct { get; init; }
 
-        public static TypeContext For(INamedTypeSymbol type) => new()
+        public static TypeContext For(INamedTypeSymbol type)
         {
-            ContainingTypeKey = TypeKey(type),
-            Namespace = NamespaceOf(type),
-            PartialChain = BuildPartialChain(type),
-            SelfTypeDecl = TypeDecl(type),
-        };
+            BuildPartialChain(type, out var chain, out var chainIsStruct);
+            return new TypeContext
+            {
+                ContainingTypeKey = TypeKey(type),
+                Namespace = NamespaceOf(type),
+                PartialChain = chain,
+                PartialChainIsStruct = chainIsStruct,
+                SelfTypeDecl = TypeDecl(type),
+                SelfIsStruct = type.IsValueType,
+            };
+        }
     }
 
     private static ImmutableArray<string> GetUsingsCached(
@@ -377,33 +420,53 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         if (!field.IsStatic) return;
         if (field.IsConst) return;
 
-        // Readonly fields are skipped unless they qualify for the Clear strategy:
-        // type has a public parameterless Clear() AND the initializer is trivial
-        // (so Clear()'s "empty container" result matches the original state).
-        var canCleanReadonly = field.IsReadOnly && Validation.CanCleanReadonlyField(field);
-        if (field.IsReadOnly && !canCleanReadonly) return;
+        // Readonly fields: exempt types (unmanaged, string, known-immutable,
+        // arrays thereof) are silently left alone; the rest qualify only for
+        // the Clear strategy — type has a parameterless Clear() and the
+        // initializer is a 'new …' expression (braced elements are restored
+        // via PostClearStatements) or default/absent.
+        var initSyntax = Validation.GetFieldInitializerSyntax(field);
+        var canCleanReadonly = false;
+        if (field.IsReadOnly)
+        {
+            if (Validation.ReadonlyTypeIsExempt(field.Type)) return;
+            canCleanReadonly = Validation.CanCleanReadonly(field.Type, initSyntax);
+            if (!canCleanReadonly) return;
+        }
 
         var owner = field.ContainingType;
         var c = ctx ?? TypeContext.For(owner);
 
         if (!Validation.IsPartialChain(owner)) return;
 
-        var (initText, initNs) = GetFieldInitializer(field, compilation);
+        var (initText, initNs) = CaptureInitializer(initSyntax, compilation);
+
+        // Disposable without an initializer: nothing to construct a
+        // replacement from after disposing, and resetting to default without
+        // disposing would leak the old instance. Skip; the analyzer reports
+        // ASC009.
+        if (!field.IsReadOnly && initText == null && Validation.HasDisposeMethod(field.Type)) return;
+
         entries.Add(new ResetEntry
         {
             ContainingTypeKey = c.ContainingTypeKey,
             Namespace = c.Namespace,
             PartialChain = c.PartialChain,
+            PartialChainIsStruct = c.PartialChainIsStruct,
             SelfTypeDecl = c.SelfTypeDecl,
+            SelfIsStruct = c.SelfIsStruct,
             MemberName = field.Name,
-            Kind = MemberKind.Assign,
-            RequiresGuard = TypeRequiresGuard(field.Type),
+            Kind = MemberKind.Field,
+            RequiresGuard = !field.IsReadOnly && TypeRequiresGuard(field.Type),
             RequiresDispose = !canCleanReadonly
                               && initText != null
-                              && Validation.ImplementsIDisposable(field.Type),
+                              && Validation.HasDisposeMethod(field.Type),
             RequiresClear = canCleanReadonly,
             Initializer = initText,
             InitializerNamespaces = initNs,
+            PostClearStatements = canCleanReadonly
+                ? ExtractPostClearStatements(field.Name, initSyntax)
+                : ImmutableArray<string>.Empty,
             SourceOrder = SourceOrderOf(field),
             FileUsings = usingsCache != null ? GetUsingsCached(field, usingsCache) : GetUsings(field),
         });
@@ -418,32 +481,60 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     {
         if (!prop.IsStatic) return;
 
-        // Expression-bodied properties carry no state.
-        if (prop.DeclaringSyntaxReferences.Length > 0
-            && prop.DeclaringSyntaxReferences[0].GetSyntax() is PropertyDeclarationSyntax { ExpressionBody: not null })
-            return;
+        // Only auto-properties are reset: manual and expression-bodied
+        // properties are silently skipped even with an explicit member-level
+        // attribute (there is no backing state we can reason about). The
+        // analyzer reports ASC003 for explicitly attributed manual properties.
+        if (!Validation.IsAutoProperty(prop)) return;
 
-        // No setter, or init-only setter — can't be reset from Cleanup().
-        if (prop.SetMethod == null || prop.SetMethod.IsInitOnly) return;
+        var initSyntax = Validation.GetPropertyInitializerSyntax(prop);
+
+        // Getter-only auto-properties follow the readonly-field rules: exempt
+        // types are silently skipped, Clear-strategy shapes are reset in place.
+        // Init-only setters can't be written from the cleanup method.
+        var canCleanReadonly = false;
+        if (prop.SetMethod == null)
+        {
+            if (Validation.ReadonlyTypeIsExempt(prop.Type)) return;
+            canCleanReadonly = Validation.CanCleanReadonly(prop.Type, initSyntax);
+            if (!canCleanReadonly) return;
+        }
+        else if (prop.SetMethod.IsInitOnly)
+        {
+            return;
+        }
 
         var owner = prop.ContainingType;
         var c = ctx ?? TypeContext.For(owner);
 
         if (!Validation.IsPartialChain(owner)) return;
 
-        var (initText, initNs) = GetPropertyInitializer(prop, compilation);
+        var (initText, initNs) = CaptureInitializer(initSyntax, compilation);
+
+        // Same rule as fields: a settable disposable property with no
+        // initializer can't be reset — skip, ASC009 reports it.
+        if (!canCleanReadonly && initText == null && Validation.HasDisposeMethod(prop.Type)) return;
+
         entries.Add(new ResetEntry
         {
             ContainingTypeKey = c.ContainingTypeKey,
             Namespace = c.Namespace,
             PartialChain = c.PartialChain,
+            PartialChainIsStruct = c.PartialChainIsStruct,
             SelfTypeDecl = c.SelfTypeDecl,
+            SelfIsStruct = c.SelfIsStruct,
             MemberName = prop.Name,
-            Kind = MemberKind.Assign,
-            RequiresGuard = TypeRequiresGuard(prop.Type),
-            RequiresDispose = initText != null && Validation.ImplementsIDisposable(prop.Type),
+            Kind = MemberKind.Property,
+            RequiresGuard = !canCleanReadonly && TypeRequiresGuard(prop.Type),
+            RequiresDispose = !canCleanReadonly
+                              && initText != null
+                              && Validation.HasDisposeMethod(prop.Type),
+            RequiresClear = canCleanReadonly,
             Initializer = initText,
             InitializerNamespaces = initNs,
+            PostClearStatements = canCleanReadonly
+                ? ExtractPostClearStatements(prop.Name, initSyntax)
+                : ImmutableArray<string>.Empty,
             SourceOrder = SourceOrderOf(prop),
             FileUsings = usingsCache != null ? GetUsingsCached(prop, usingsCache) : GetUsings(prop),
         });
@@ -473,10 +564,13 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             ContainingTypeKey = c.ContainingTypeKey,
             Namespace = c.Namespace,
             PartialChain = c.PartialChain,
+            PartialChainIsStruct = c.PartialChainIsStruct,
             SelfTypeDecl = c.SelfTypeDecl,
+            SelfIsStruct = c.SelfIsStruct,
             MemberName = evt.Name,
             Kind = MemberKind.Event,
-            DelegateTypeFq = evt.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
+            // Default display format — namespace-qualified, no global::.
+            DelegateTypeName = evt.Type.ToDisplayString(),
             SourceOrder = SourceOrderOf(evt),
             FileUsings = usingsCache != null ? GetUsingsCached(evt, usingsCache) : GetUsings(evt),
         });
@@ -487,15 +581,12 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
     // -----------------------------------------------------------------
 
     /// <summary>
-    /// True when a `default` write should be guarded with `is not null`.
-    /// Reference types and any type parameter — guard. Non-nullable value
-    /// types — no guard.
+    /// True when a reset write should be guarded with `is not null`:
+    /// reference types only. Type parameters count only when constrained to
+    /// be reference types (<c>IsReferenceType</c> is false for unconstrained
+    /// <c>T</c>, which gets the bare assignment).
     /// </summary>
-    private static bool TypeRequiresGuard(ITypeSymbol type)
-    {
-        if (type is ITypeParameterSymbol) return true;
-        return type.IsReferenceType;
-    }
+    private static bool TypeRequiresGuard(ITypeSymbol type) => type.IsReferenceType;
 
     private static int SourceOrderOf(ISymbol symbol) =>
         symbol.DeclaringSyntaxReferences.Length == 0
@@ -529,33 +620,51 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         return sb.ToString();
     }
 
-    private static ImmutableArray<string> BuildPartialChain(INamedTypeSymbol type)
+    private static void BuildPartialChain(
+        INamedTypeSymbol type, out ImmutableArray<string> names, out ImmutableArray<bool> isStruct)
     {
         // Walk inner-to-outer (cheap), then reverse — avoids List.Insert(0)'s
         // O(n²) shifting on deeply nested types.
         var chain = ImmutableArray.CreateBuilder<string>();
+        var structFlags = ImmutableArray.CreateBuilder<bool>();
         for (var t = type.ContainingType; t != null; t = t.ContainingType)
+        {
             chain.Add(TypeDecl(t));
+            structFlags.Add(t.IsValueType);
+        }
         chain.Reverse();
-        return chain.ToImmutable();
+        structFlags.Reverse();
+        names = chain.ToImmutable();
+        isStruct = structFlags.ToImmutable();
     }
 
-    private static (string Text, ImmutableArray<string> Namespaces) GetFieldInitializer(
-        IFieldSymbol field, Compilation compilation)
+    /// <summary>
+    /// For a readonly collection member reset via Clear() whose initializer
+    /// has braced elements — <c>new() { 1, 2 }</c>, <c>new() { { k, v } }</c>,
+    /// <c>new() { [k] = v }</c> — renders the statements that restore the
+    /// initial content afterwards: two-expression initializer elements become
+    /// indexer writes, everything else becomes <c>.Add(…)</c>.
+    /// (C# 12 collection expressions are omitted deliberately — the target
+    /// compilers don't parse them.)
+    /// </summary>
+    private static ImmutableArray<string> ExtractPostClearStatements(
+        string memberName, ExpressionSyntax initSyntax)
     {
-        if (field.DeclaringSyntaxReferences.Length == 0) return (null, ImmutableArray<string>.Empty);
-        if (field.DeclaringSyntaxReferences[0].GetSyntax() is not VariableDeclaratorSyntax vds)
-            return (null, ImmutableArray<string>.Empty);
-        return CaptureInitializer(vds.Initializer?.Value, compilation);
-    }
+        if (initSyntax is not BaseObjectCreationExpressionSyntax { Initializer: { } initializer })
+            return ImmutableArray<string>.Empty;
 
-    private static (string Text, ImmutableArray<string> Namespaces) GetPropertyInitializer(
-        IPropertySymbol prop, Compilation compilation)
-    {
-        if (prop.DeclaringSyntaxReferences.Length == 0) return (null, ImmutableArray<string>.Empty);
-        if (prop.DeclaringSyntaxReferences[0].GetSyntax() is not PropertyDeclarationSyntax pds)
-            return (null, ImmutableArray<string>.Empty);
-        return CaptureInitializer(pds.Initializer?.Value, compilation);
+        var exprs = initializer.Expressions;
+        if (exprs.Count == 0) return ImmutableArray<string>.Empty;
+
+        var builder = ImmutableArray.CreateBuilder<string>(exprs.Count);
+        foreach (var expr in exprs)
+        {
+            if (expr is InitializerExpressionSyntax { Expressions.Count: 2 } complex)
+                builder.Add($"{memberName}[{complex.Expressions[0]}] = {complex.Expressions[1]};");
+            else
+                builder.Add($"{memberName}.Add({expr});");
+        }
+        return builder.MoveToImmutable();
     }
 
     private static (string Text, ImmutableArray<string> Namespaces) CaptureInitializer(
@@ -671,7 +780,8 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             // Caller has already grouped by containing type, deduped, and ordered.
             EmitFileHeader(w, entries);
 
-            var ordered = entries.OrderBy(e => e.Kind == MemberKind.Event ? 1 : 0)
+            // Fields, then properties, then events, each in declaration order.
+            var ordered = entries.OrderBy(e => e.Kind)
                                  .ThenBy(e => e.SourceOrder)
                                  .ToList();
             EmitTypeBlock(w, ordered[0], ordered);
@@ -704,14 +814,14 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             foreach (var n in e.InitializerNamespaces) requiredNs.Add(n);
         }
 
-        // Insertion-ordered dedupe: emit System and Unity.Scripting.LifecycleManagement
-        // first (matches Unity's layout), then any source-file using actually
-        // needed by an initializer.
+        // Insertion-ordered dedupe: emit Unity.Scripting.LifecycleManagement
+        // first, then any source-file using actually needed by an initializer.
+        // Every using is followed by a blank line — part of the pinned output
+        // layout.
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var ordered = new List<string>();
         void Add(string u) { if (seen.Add(u)) ordered.Add(u); }
 
-        Add("using System;");
         Add("using Unity.Scripting.LifecycleManagement;");
         foreach (var e in entries)
         {
@@ -722,7 +832,11 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
                 if (UsingIsNeeded(u, requiredNs)) Add(u);
             }
         }
-        foreach (var u in ordered) w.WriteLine(u);
+        foreach (var u in ordered)
+        {
+            w.WriteLine(u);
+            w.WriteLine();
+        }
     }
 
     /// <summary>
@@ -765,19 +879,21 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
             w.Indent++;
         }
 
-        foreach (var outer in sample.PartialChain)
+        // `partial struct` for value types — matching the user's declaration
+        // kind is required for the partial declarations to merge (CS0261).
+        for (var i = 0; i < sample.PartialChain.Length; i++)
         {
-            w.WriteLine($"partial class {outer}");
+            w.WriteLine($"partial {(sample.PartialChainIsStruct[i] ? "struct" : "class")} {sample.PartialChain[i]}");
             w.WriteLine("{");
             w.Indent++;
         }
 
-        w.WriteLine($"partial class {sample.SelfTypeDecl}");
+        w.WriteLine($"partial {(sample.SelfIsStruct ? "struct" : "class")} {sample.SelfTypeDecl}");
         w.WriteLine("{");
         w.Indent++;
 
-        EmitNestedCleanupClass(w, entries);
-        EmitStaticReadonlyField(w);
+        EmitCleanupMethod(w, entries);
+        EmitRegistrationField(w, OwnerDescription(sample));
 
         w.Indent--;
         w.WriteLine("}");
@@ -795,14 +911,10 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         }
     }
 
-    private static void EmitNestedCleanupClass(IndentedTextWriter w, IReadOnlyList<ResetEntry> entries)
+    private static void EmitCleanupMethod(IndentedTextWriter w, IReadOnlyList<ResetEntry> entries)
     {
         w.WriteLine(CompilerGeneratedAttr);
-        w.WriteLine($"class {NestedClassName} : {CleanupBaseTypeFullName}");
-        w.WriteLine("{");
-        w.Indent++;
-
-        w.WriteLine("public override void Cleanup()");
+        w.WriteLine($"static void {CleanupMethodName}()");
         w.WriteLine("{");
         w.Indent++;
 
@@ -814,27 +926,51 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
 
         w.Indent--;
         w.WriteLine("}");
-
-        w.WriteLine($"public {NestedClassName}() : base() {{}}");
-
-        w.Indent--;
-        w.WriteLine("}");
     }
 
-    private static void EmitStaticReadonlyField(IndentedTextWriter w)
+    private static void EmitRegistrationField(IndentedTextWriter w, string ownerDescription)
     {
         w.WriteLine(CompilerGeneratedAttr);
-        w.WriteLine($"static readonly {NestedClassName} {StaticFieldName} = new();");
+        w.WriteLine($"static readonly {DelegateCleanupTypeFullName} {RegistrationFieldName} = "
+                    + $"{DelegateCleanupTypeFullName}.CreateForPlayMode({CleanupMethodName}, \"{ownerDescription}\");");
+    }
+
+    /// <summary>
+    /// The diagnostic string passed as DelegateAutoCleanup's ownerDescription
+    /// (surfaced via ToString() when a cleanup fails): the dotted type path
+    /// with generic angle brackets flattened to underscores —
+    /// <c>MyNs.Outer.Inner</c>, <c>MyNs.Singleton_T_</c>. Commas and spaces
+    /// inside generic argument lists are kept (only &lt; and &gt; are
+    /// replaced).
+    /// </summary>
+    private static string OwnerDescription(ResetEntry sample)
+    {
+        var sb = new StringBuilder();
+        if (!string.IsNullOrEmpty(sample.Namespace))
+        {
+            sb.Append(sample.Namespace);
+            sb.Append('.');
+        }
+        foreach (var outer in sample.PartialChain)
+        {
+            sb.Append(outer);
+            sb.Append('.');
+        }
+        sb.Append(sample.SelfTypeDecl);
+        return sb.Replace('<', '_').Replace('>', '_').ToString();
     }
 
     private static void EmitAssign(IndentedTextWriter w, ResetEntry e)
     {
         if (e.RequiresClear)
         {
-            // Readonly + Clear() strategy: empty the container in place.
-            // Trivial-initializer gate (checked in CanCleanReadonlyField)
-            // guarantees the original state matches Clear()'s post-state.
+            // Readonly + Clear() strategy: empty the container in place, then
+            // restore any braced initializer elements (PostClearStatements) so
+            // the post-cleanup state matches the original initializer.
             w.WriteLine($"{e.MemberName}.Clear();");
+            if (!e.PostClearStatements.IsDefaultOrEmpty)
+                foreach (var s in e.PostClearStatements)
+                    w.WriteLine(s);
             return;
         }
 
@@ -843,9 +979,11 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         {
             // Dispose the existing value before reassigning. The null guard is
             // merged into the same branch when the field is a reference type so
-            // a never-touched field is a single check, not two.
+            // a never-touched field is a single check, not two. The `){` with
+            // no space is deliberate — the exact text is pinned by the
+            // byte-for-byte output tests.
             if (e.RequiresGuard)
-                w.WriteLine($"if({e.MemberName} is not null) {{ {e.MemberName}.Dispose(); {e.MemberName} = {rhs}; }}");
+                w.WriteLine($"if({e.MemberName} is not null){{ {e.MemberName}.Dispose(); {e.MemberName} = {rhs}; }}");
             else
                 w.WriteLine($"{e.MemberName}.Dispose(); {e.MemberName} = {rhs};");
         }
@@ -860,7 +998,7 @@ public class AutoStaticsCleanupGenerator : IIncrementalGenerator
         w.WriteLine($"if({e.MemberName} != null)");
         w.WriteLine("{");
         w.Indent++;
-        w.WriteLine($"foreach({e.DelegateTypeFq} handler in {e.MemberName}.GetInvocationList())");
+        w.WriteLine($"foreach({e.DelegateTypeName} handler in {e.MemberName}.GetInvocationList())");
         w.WriteLine("{");
         w.Indent++;
         w.WriteLine($"{e.MemberName} -= handler;");
